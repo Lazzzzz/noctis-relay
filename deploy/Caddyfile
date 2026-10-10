@@ -1,0 +1,16 @@
+# HTTPS front for the relay. Caddy obtains a certificate automatically for
+# NOCTIS_DOMAIN (DNS A/AAAA records must point to the server, ports 80/443 open).
+# No `log` directive: Caddy writes no access log.
+{$NOCTIS_DOMAIN} {
+	request_body {
+		max_size 4KB
+	}
+	reverse_proxy relay:8787 {
+		# Replace any client-supplied value with the real peer address.
+		header_up X-Forwarded-For {remote_host}
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}

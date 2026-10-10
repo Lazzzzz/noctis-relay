@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit and API tests
+        run: python -W error::ResourceWarning -m unittest discover -s tests -t . -v
+      - name: Spatial benchmark (smoke)
+        run: python bench/bench_spatial.py --players 2000 --hot 200 --updates 5000 --density 200
+      - name: HTTP benchmark (smoke)
+        run: python bench/bench_http.py --clients 50 --seconds 3
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t noctis-relay:ci .
+      - name: Smoke test as non-root
+        run: |
+          docker run -d --name relay --read-only --cap-drop ALL -p 127.0.0.1:8787:8787 \
+            -e NOCTIS_OPERATOR_NAME=CI -e NOCTIS_OPERATOR_CONTACT=ci@example.invalid noctis-relay:ci
+          for i in $(seq 30); do curl -fsS http://127.0.0.1:8787/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8787/v1/info
+          test "$(docker exec relay id -u)" = "10001"
+          docker rm -f relay

@@ -1,0 +1,62 @@
+# Local loop by default: the relay is only published on 127.0.0.1:8787.
+#   docker compose up -d --build                  # relay only
+#   docker compose --profile https up -d --build  # relay + Caddy (HTTPS)
+services:
+  relay:
+    build: .
+    env_file: .env
+    environment:
+      NOCTIS_HOST: 0.0.0.0
+      NOCTIS_PORT: "8787"
+      # X-Forwarded-For is honoured only from the Caddy container below
+      # (fixed address); any other peer is rate limited by its own address.
+      NOCTIS_TRUST_PROXY: "1"
+      NOCTIS_TRUSTED_PROXIES: 172.31.240.10/32
+    ports:
+      - "${NOCTIS_PUBLISH:-127.0.0.1}:${NOCTIS_HOST_PORT:-8787}:8787"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    mem_limit: 256m
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "1m", max-file: "3"}
+    networks:
+      relay:
+        ipv4_address: 172.31.240.2
+
+  caddy:
+    image: caddy:2
+    profiles: [https]
+    depends_on: [relay]
+    environment:
+      # Optional for relay-only/IP tests. The HTTPS profile requires a real domain.
+      NOCTIS_DOMAIN: ${NOCTIS_DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "1m", max-file: "3"}
+    networks:
+      relay:
+        ipv4_address: 172.31.240.10
+
+networks:
+  relay:
+    ipam:
+      config:
+        - subnet: 172.31.240.0/24
+
+volumes:
+  caddy_data:
+  caddy_config:
