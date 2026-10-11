@@ -83,7 +83,7 @@ def main():
         time.sleep(0.3)
 
     status, info = call(base, "GET", "/v1/info")
-    expect(status == 200 and info["privacyRevision"] == 3, "info privacy revision 3")
+    expect(status == 200 and info["privacyRevision"] == 4, "info privacy revision 4")
     expect("echoes" in info["capabilities"] and "chat" in info["capabilities"], "echoes and chat offered")
     expect(info["echoes"]["maxBodyBytes"] >= 1024, "echo settings published")
 
