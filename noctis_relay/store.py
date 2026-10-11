@@ -1,7 +1,8 @@
 """In-memory SQLite store for sessions, optional presence and echo clips.
 
 Nothing is written to disk: the database lives in process memory and is
-lost on restart, which is the intended retention policy. All access happens
+lost on restart, which is the intended retention policy. Clips of opted-in
+owners may additionally be sampled into the durable archive (archive.py). All access happens
 from the single event-loop thread, so one connection is enough and there is
 no writer contention.
 """
@@ -35,9 +36,14 @@ CREATE TABLE session (
     last_publish REAL NOT NULL DEFAULT -1e300,
     last_fetch REAL NOT NULL DEFAULT -1e300,
     -- Hash of the last accepted chat line (duplicate filter), overwritten.
-    last_chat BLOB NOT NULL DEFAULT x''
+    last_chat BLOB NOT NULL DEFAULT x'',
+    -- Hash of the owner secret (archive and private deletion), and the
+    -- account the client declared (only used to exclude its own replays).
+    owner BLOB,
+    account TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX session_expires ON session(expires);
+CREATE INDEX session_owner ON session(owner) WHERE owner IS NOT NULL;
 CREATE INDEX session_net ON session(net, expires);
 
 -- Clustered on the spatial key: a neighbour lookup is a handful of B-tree
@@ -79,13 +85,16 @@ CREATE TABLE clip (
     expires REAL NOT NULL,
     body TEXT NOT NULL,
     chat TEXT,
+    -- Archive row sampled from this clip, so an observer does not get it twice.
+    archive_id INTEGER,
     PRIMARY KEY (realm, profile, cx, cz, cy, sid)
 ) WITHOUT ROWID;
 CREATE UNIQUE INDEX clip_sid ON clip(sid);
 CREATE UNIQUE INDEX clip_id ON clip(clip_id);
 CREATE INDEX clip_expires ON clip(expires);
 
--- Clips already handed to an observer, so each is replayed at most once.
+-- Clips already handed to an observer, so each is replayed at most once
+-- (archived clips are recorded under their negated archive id).
 CREATE TABLE delivered (
     observer INTEGER NOT NULL,
     clip_id INTEGER NOT NULL,
@@ -94,6 +103,10 @@ CREATE TABLE delivered (
 ) WITHOUT ROWID;
 CREATE INDEX delivered_expires ON delivered(expires);
 """
+
+
+# How long an observer's session remembers an archived clip it was shown.
+ARCHIVE_SEEN = 6 * 3600.0
 
 
 def hash_token(token: str) -> bytes:
@@ -114,6 +127,8 @@ class Session:
     last_publish: float = -1e300
     last_fetch: float = -1e300
     last_chat: bytes = b""
+    owner: bytes | None = None
+    account: str = ""
 
 
 @dataclass(frozen=True)
@@ -134,6 +149,7 @@ class Echo:
     z: float
     body: str
     chat: str | None
+    archive_id: int | None = None
 
 
 class CapacityError(Exception):
@@ -198,7 +214,8 @@ class Store:
         ).fetchone()[0]
 
     def create_session(
-        self, presence: bool = False, net: bytes = b"", echoes: bool = False, chat: bool = False
+        self, presence: bool = False, net: bytes = b"", echoes: bool = False, chat: bool = False,
+        owner: bytes | None = None, account: str = "",
     ) -> tuple[str, Session]:
         now = self.clock()
         if self._session_rows >= self.max_sessions:
@@ -210,22 +227,24 @@ class Store:
         token = secrets.token_hex(32)
         expires = now + self.retention
         cur = self.db.execute(
-            "INSERT INTO session(token_hash, expires, presence, net, echoes, chat) VALUES (?, ?, ?, ?, ?, ?)",
-            (hash_token(token), expires, 1 if presence else 0, net, int(echoes), int(chat)),
+            "INSERT INTO session(token_hash, expires, presence, net, echoes, chat, owner, account) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (hash_token(token), expires, 1 if presence else 0, net, int(echoes), int(chat), owner, account),
         )
         self._session_rows += 1
-        return token, Session(cur.lastrowid, expires, presence, -1e300, net, echoes, chat)
+        return token, Session(cur.lastrowid, expires, presence, -1e300, net, echoes, chat,
+                              owner=owner, account=account)
 
     def find_session(self, token: str) -> Session | None:
         row = self.db.execute(
             "SELECT sid, expires, presence, last_presence, net, echoes, chat, last_publish, last_fetch, "
-            "last_chat FROM session WHERE token_hash = ?",
+            "last_chat, owner, account FROM session WHERE token_hash = ?",
             (hash_token(token),),
         ).fetchone()
         if row is None or row[1] <= self.clock():
             return None
         return Session(row[0], row[1], bool(row[2]), row[3], row[4], bool(row[5]), bool(row[6]),
-                       row[7], row[8], row[9])
+                       row[7], row[8], row[9], row[10], row[11])
 
     def refresh_session(self, session: Session, net: bytes | None = None) -> Session | None:
         """Extend a live session and attribute it to ``net`` (if given)."""
@@ -240,6 +259,27 @@ class Store:
         if row is None:
             return None
         return dataclasses.replace(session, expires=expires, net=net)
+
+    def forget_owner(self, owner: bytes, chat_only: bool) -> int:
+        """Private deletion: end every live session of ``owner`` (or only its chat)."""
+        db = self.db
+        db.execute("BEGIN")
+        try:
+            sids = [r[0] for r in db.execute("SELECT sid FROM session WHERE owner = ?", (owner,))]
+            if chat_only:
+                db.execute("UPDATE session SET chat = 0 WHERE owner = ?", (owner,))
+                db.executemany("UPDATE clip SET chat = NULL WHERE sid = ?", ((sid,) for sid in sids))
+            else:
+                for sid in sids:
+                    db.execute("DELETE FROM presence WHERE sid = ?", (sid,))
+                    self._forget_echoes(sid)
+                db.executemany("DELETE FROM session WHERE sid = ?", ((sid,) for sid in sids))
+                self._session_rows -= len(sids)
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
+        return len(sids)
 
     def delete_session(self, token: str) -> bool:
         db = self.db
@@ -391,7 +431,7 @@ class Store:
         # One B-tree seek per neighbouring horizontal cell; delivery exclusion
         # is a primary-key probe per candidate row.
         return (
-            "SELECT sid, clip_id, x, y, z, created, body, chat, "
+            "SELECT sid, clip_id, x, y, z, created, body, chat, archive_id, "
             "(x - ?) * (x - ?) + (z - ?) * (z - ?) AS d2 FROM clip "
             f"WHERE realm = ? AND profile = ? AND cx IN ({marks}) AND cz IN ({marks}) "
             "AND cy BETWEEN ? AND ? AND expires > ? AND sid != ? AND instance != ? "
@@ -415,6 +455,31 @@ class Store:
             float(self.echo_radius * self.echo_radius), y, float(self.echo_vertical),
             sid, now,
         ]
+
+    def link_archive(self, session: Session, archive_id: int) -> None:
+        self.db.execute("UPDATE clip SET archive_id = ? WHERE sid = ?", (archive_id, session.sid))
+
+    def was_delivered(self, session: Session, archive_id: int) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM delivered WHERE observer = ? AND clip_id = ?", (session.sid, -archive_id)
+        ).fetchone() is not None
+
+    def mark_delivered(self, session: Session, archive_id: int, seconds: float) -> None:
+        """Remember an archived clip for this observer's session (bounded by its lifetime)."""
+        self.db.execute(
+            "INSERT OR IGNORE INTO delivered(observer, clip_id, expires) VALUES (?, ?, ?)",
+            (session.sid, -archive_id, self.clock() + seconds),
+        )
+
+    def touch_fetch(self, session: Session, net: bytes | None = None) -> None:
+        now = self.clock()
+        self.db.execute(
+            "UPDATE session SET expires = ?, last_fetch = ?, net = ? WHERE sid = ?",
+            (now + self.retention, now, session.net if net is None else net, session.sid),
+        )
+
+    def archived_ref(self, session: Session, archive_id: int) -> str:
+        return self._ref(session.sid, (1 << 62) + archive_id)
 
     @staticmethod
     def instance_key(instance: str) -> bytes:
@@ -481,6 +546,11 @@ class Store:
                     "INSERT OR IGNORE INTO delivered(observer, clip_id, expires) VALUES (?, ?, ?)",
                     (session.sid, row[1], now + self.echo_ttl),
                 )
+                if row[8] is not None:  # its archived copy must not come back later
+                    db.execute(
+                        "INSERT OR IGNORE INTO delivered(observer, clip_id, expires) VALUES (?, ?, ?)",
+                        (session.sid, -row[8], now + ARCHIVE_SEEN),
+                    )
             db.execute("COMMIT")
         except BaseException:
             db.execute("ROLLBACK")
@@ -488,7 +558,7 @@ class Store:
         if row is None:
             return None
         return Echo(self._ref(session.sid, row[0]), max(0.0, now - row[5]), row[2], row[3], row[4],
-                    row[6], row[7] if session.chat else None)
+                    row[6], row[7] if session.chat else None, row[8])
 
     def explain_echo(self) -> list[str]:
         params = self._echo_params("r", "p", 0.0, 64.0, 0.0, 0.0, 0, b"")

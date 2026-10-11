@@ -1,4 +1,4 @@
-# Privacy notice — revision 3
+# Privacy notice — revision 4
 
 This describes what the **noctis-relay software** does with data. Each relay is
 run by an independent operator whose name and contact are published at
@@ -9,6 +9,12 @@ software authors, is responsible for running the relay lawfully (for example
 under the GDPR in the EU). Using this software does not by itself make a relay
 compliant with any regulation.
 
+Revision 4 (relay 0.4.0) adds the optional **durable archive** of echoes (off
+unless the operator sets `NOCTIS_ARCHIVE_PATH`): a sample of clips is kept on
+disk for up to 92 days with a hash of a private owner key, and can be deleted
+by its owner (below). It also filters insults and slurs out of echo chat.
+An operator may also publish fictional demonstration clips containing no real
+player data; the mod displays those finite test identities with its built-in skin.
 Revision 3 (relay 0.3.0) adds the optional **echoes** capability (off by
 default): opted-in players' Minecraft account UUID, position, short movement
 clips, block actions and, separately, chat lines (below). Revision 2 (relay
@@ -84,17 +90,56 @@ empreinte tronquée de la dernière ligne reste avec la session pour écarter le
 doublons. Les lignes ne sont remises qu'aux observateurs qui ont aussi activé
 le chat.
 
+**Archive durable (optionnelle, désactivée par défaut).** Seulement si
+l'opérateur définit `NOCTIS_ARCHIVE_PATH` et que le relais l'annonce
+(`archive` dans `/v1/info`) : votre jeu envoie alors, avec votre accord aux
+échos, une **clé de propriétaire** aléatoire propre à ce relais et à ce compte,
+gardée dans un fichier privé de votre jeu et jamais affichée. Le relais n'en
+conserve que l'empreinte SHA-256 tronquée. Une partie de vos clips est
+gardée **sur disque** : au plus un toutes les 5 minutes et 48 par jour,
+24 par jour et par cellule de 32 × 16 × 32 blocs, ni les clips immobiles sans action. Une
+entrée contient l'empreinte de la clé, l'UUID du compte, la dimension, le
+profil de terrain, l'empreinte de la partie (SHA-256 tronqué de son
+identifiant, stable d'un redémarrage à l'autre pour ne jamais vous montrer
+vos voisins de partie), la position, la date, les mouvements, les actions et,
+si vous avez accepté le chat, ses lignes filtrées. Ni adresse IP, ni empreinte
+de réseau, ni jeton. Ces clips peuvent être rejoués à d'autres joueurs
+volontaires proches, **même après votre déconnexion**, pendant
+`NOCTIS_ARCHIVE_DAYS` (92 jours par défaut) ; chaque observateur ne reçoit un
+même clip qu'une fois par session d'observateur (pendant 6 heures). Le fichier est créé avec les
+droits 0600, en WAL avec suppression sécurisée des pages libérées.
+
+**Suppression privée.** Refuser les échos en jeu demande la suppression de
+**toutes** vos archives sur ce relais ; désactiver le chat demande celle de
+leurs lignes de chat. Le jeu envoie la clé à `POST /v1/archive/forget`,
+réessaie jusqu'à confirmation (y compris hors de Noctis ou après un
+redémarrage), n'ouvre aucune nouvelle session vers ce relais pour ce compte
+d'ici là, puis remplace la clé après une suppression complète. Le relais
+supprime les clips concernés dans une transaction puis tronque le journal
+WAL ; ses sauvegardes éventuelles relèvent de l'opérateur. L'UUID seul ne
+permet ni de supprimer, ni de lister des archives : seule la clé le permet.
+Changer d'adresse de relais ne transmet jamais la clé de l'ancien relais au
+nouveau.
+
+**Filtre du chat.** Les lignes contenant des insultes ou injures françaises ou
+anglaises connues (variantes de casse, accents, lettres masquées ou espacées,
+« leetspeak ») sont écartées entières, à l'envoi puis de nouveau à la
+remise. Ce filtre hors ligne n'est pas une garantie : contexte, autres langues
+et contournements créatifs passent.
+
 **Durée.** Sessions et positions expirent après `retentionSeconds` (30 s par
 défaut, 120 s au maximum) sans renouvellement, sont purgées en continu et
 disparaissent toutes au redémarrage du relais. Un clip expire après
 `NOCTIS_ECHO_TTL` (60 s par défaut, 120 s au maximum) et la trace de remise
-après la même durée. Rien n'est écrit sur disque. Ce qu'un autre joueur a déjà
-vu ne peut pas être repris.
+après la même durée. Sans archive, rien n'est écrit sur disque ; avec, voir
+ci-dessus : les clips archivés sont purgés en continu après
+`NOCTIS_ARCHIVE_DAYS`. Ce qu'un autre joueur a déjà vu ne peut pas être
+repris.
 
 **Retrait.** Désactiver l'option, quitter Noctis, changer de compte ou de relais
 ferme la session, ce qui supprime aussitôt son clip, son chat et ses traces de
 remise (`DELETE /v1/session` ou `DELETE /v1/echoes`) ; à défaut, tout expire
-de soi-même.
+de soi-même. Les archives se retirent par la suppression privée ci-dessus.
 
 ## English
 
@@ -156,13 +201,48 @@ duplicates are dropped; a truncated fingerprint of your last line stays with
 the session to drop duplicates. Lines are only served to observers who also
 enabled chat.
 
+**Durable archive (optional, off by default).** Only if the operator sets
+`NOCTIS_ARCHIVE_PATH` and the relay announces it (`archive` in `/v1/info`):
+with your echoes consent, your game then sends a random **owner key** specific
+to this relay and account, kept in a private file of your game and never
+shown. The relay keeps only its truncated SHA-256. Part of your clips is kept
+**on disk**: at most one every 5 minutes and 48 a day, 24 a day per 32 × 16 × 32-block
+area, and no idle clip without actions. An entry holds the key hash, the
+account UUID, the dimension, the terrain profile, the game fingerprint
+(truncated SHA-256 of its id, stable across relay restarts so that you are
+never shown players of your own game), the position, the date, the movements,
+the actions and, if you accepted chat, its filtered lines. No IP address,
+network fingerprint or token. These clips may be replayed to other opted-in
+players nearby **even after you left**, for `NOCTIS_ARCHIVE_DAYS` (92 days by
+default); a given observer session receives a given clip at most once (for
+6 hours). The
+file is created with mode 0600, in WAL mode with secure deletion of freed
+pages.
+
+**Private deletion.** Declining echoes in game requests the deletion of
+**all** your archives on this relay; turning chat off requests that of their
+chat lines. The game sends the key to `POST /v1/archive/forget`, retries until
+confirmed (also outside Noctis or after a restart), opens no new session to
+that relay for that account meanwhile, then replaces the key after a full
+deletion. The relay deletes the clips in one transaction then truncates its
+WAL journal; any backups are the operator's responsibility. The UUID alone
+can neither delete nor list archives: only the key can. Changing the relay
+address never sends the former relay's key to the new one.
+
+**Chat filter.** Lines containing known French or English insults or slurs
+(case, accent, masked or spaced letters and leetspeak variants) are dropped
+whole, when uploaded and again when served. This offline filter is not a
+guarantee: context, other languages and creative evasion get through.
+
 **Retention.** Sessions and positions expire after `retentionSeconds` (30 s by
 default, 120 s maximum) without renewal, are purged continuously and are all
 lost when the relay restarts. A clip expires after `NOCTIS_ECHO_TTL` (60 s by
-default, 120 s maximum) and its delivery records after the same time. Nothing
-is written to disk. What another player has already seen cannot be taken back.
+default, 120 s maximum) and its delivery records after the same time. Without
+an archive nothing is written to disk; with one, see above: archived clips are
+purged continuously after `NOCTIS_ARCHIVE_DAYS`. What another player has
+already seen cannot be taken back.
 
 **Withdrawal.** Turning the option off, leaving Noctis, or changing account or
 relay closes the session, which immediately deletes its clip, chat lines and
 delivery records (`DELETE /v1/session` or `DELETE /v1/echoes`); otherwise
-everything simply expires.
+everything simply expires. Archives are removed by the private deletion above.

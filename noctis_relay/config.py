@@ -143,6 +143,23 @@ class Config:
     echo_max_vertical_speed: float = 4.0
     global_echo_rate: float = 200.0
     global_echo_burst: int = 400
+    # Durable archive of sampled clips from opted-in owners ("" = off).
+    archive_path: str = ""
+    archive_days: int = 92
+    archive_interval: int = 300
+    archive_owner_daily: int = 48
+    archive_cell_daily: int = 24
+    archive_cell_max: int = 1024
+    archive_max_clips: int = 4_000_000
+    archive_max_bytes: int = 16 * 1024 ** 3
+    archive_rate: float = 3.0
+    archive_burst: int = 300
+    archive_purge_batch: int = 200
+    archive_check: str = "off"
+    # Offline FR/EN insult filter on echo chat lines, plus operator lists.
+    chat_filter: bool = True
+    chat_blocklist_file: str = ""
+    chat_allowlist_file: str = ""
 
     def __post_init__(self) -> None:
         if self.heartbeat_seconds * 2 > self.retention_seconds:
@@ -151,6 +168,10 @@ class Config:
             raise ConfigError("NOCTIS_SESSION_BINDING must be migrate or strict")
         if self.echo_chat_enabled and not self.echoes_enabled:
             raise ConfigError("NOCTIS_ECHO_CHAT requires NOCTIS_ECHOES")
+        if self.archive_path and not self.echoes_enabled:
+            raise ConfigError("NOCTIS_ARCHIVE_PATH requires NOCTIS_ECHOES")
+        if self.archive_check not in ("off", "quick"):
+            raise ConfigError("NOCTIS_ARCHIVE_CHECK must be off or quick")
 
 
 def load_deny_file(path: str) -> list:
@@ -230,4 +251,19 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         echo_max_vertical_speed=_float(env, "NOCTIS_ECHO_MAX_VERTICAL_SPEED", 4.0, 0.1, 8.0),
         global_echo_rate=_float(env, "NOCTIS_GLOBAL_ECHO_RATE", 200.0, 0.0, 1_000_000.0),
         global_echo_burst=_int(env, "NOCTIS_GLOBAL_ECHO_BURST", 400, 1, 10_000_000),
+        archive_path=env.get("NOCTIS_ARCHIVE_PATH", "").strip(),
+        archive_days=_int(env, "NOCTIS_ARCHIVE_DAYS", 92, 1, 3650),
+        archive_interval=_int(env, "NOCTIS_ARCHIVE_INTERVAL", 300, 0, 86_400),
+        archive_owner_daily=_int(env, "NOCTIS_ARCHIVE_OWNER_DAILY", 48, 1, 100_000),
+        archive_cell_daily=_int(env, "NOCTIS_ARCHIVE_CELL_DAILY", 24, 1, 100_000),
+        archive_cell_max=_int(env, "NOCTIS_ARCHIVE_CELL_MAX", 1024, 1, 1_000_000),
+        archive_max_clips=_int(env, "NOCTIS_ARCHIVE_MAX_CLIPS", 4_000_000, 1, 1_000_000_000),
+        archive_max_bytes=_int(env, "NOCTIS_ARCHIVE_MAX_MB", 16_384, 1, 16_777_216) * 1024 * 1024,
+        archive_rate=_float(env, "NOCTIS_ARCHIVE_RATE", 3.0, 0.0, 100_000.0),
+        archive_burst=_int(env, "NOCTIS_ARCHIVE_BURST", 300, 1, 10_000_000),
+        archive_purge_batch=_int(env, "NOCTIS_ARCHIVE_PURGE_BATCH", 200, 1, 100_000),
+        archive_check=_text(env, "NOCTIS_ARCHIVE_CHECK", "off", 8).lower(),
+        chat_filter=_bool(env, "NOCTIS_CHAT_FILTER", True),
+        chat_blocklist_file=env.get("NOCTIS_CHAT_BLOCKLIST_FILE", "").strip(),
+        chat_allowlist_file=env.get("NOCTIS_CHAT_ALLOWLIST_FILE", "").strip(),
     )

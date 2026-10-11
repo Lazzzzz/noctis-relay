@@ -23,9 +23,11 @@ from dataclasses import dataclass
 from typing import Callable
 
 from . import PRIVACY_REVISION, PROTOCOL, __version__
+from .archive import Archive, ArchiveError, owner_hash
 from .config import Config, ConfigError, load_config, load_deny_file
+from .profanity import Filter
 from .ratelimit import Bucket, Concurrency, Fingerprints, NetworkSet, TokenBuckets, client_key, prefix_key
-from .store import AreaFullError, CapacityError, Session, Store
+from .store import ARCHIVE_SEEN, AreaFullError, CapacityError, Echo, Session, Store
 
 log = logging.getLogger("noctis_relay")
 
@@ -165,10 +167,56 @@ def _protocol(obj: dict) -> None:
 # -- API ---------------------------------------------------------------------
 
 
+def load_chat_filter(config: Config) -> Filter | None:
+    if not config.chat_filter:
+        return None
+    texts = []
+    for key, path in (("NOCTIS_CHAT_BLOCKLIST_FILE", config.chat_blocklist_file),
+                      ("NOCTIS_CHAT_ALLOWLIST_FILE", config.chat_allowlist_file)):
+        if not path:
+            texts.append("")
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                texts.append(fh.read(1024 * 1024))
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ConfigError(f"{key}: cannot read ({type(exc).__name__})") from None
+    return Filter.with_files(*texts)
+
+
+def open_archive(config: Config, wallclock: Callable[[], float] = time.time) -> Archive | None:
+    if not config.archive_path:
+        return None
+    return Archive(
+        config.archive_path,
+        days=config.archive_days,
+        cell_size=config.cell_size,
+        cell_height=config.cell_height,
+        radius=config.echo_radius,
+        vertical=config.echo_vertical,
+        interval=config.archive_interval,
+        owner_daily=config.archive_owner_daily,
+        cell_daily=config.archive_cell_daily,
+        cell_max=config.archive_cell_max,
+        max_clips=config.archive_max_clips,
+        max_bytes=config.archive_max_bytes,
+        min_age=config.echo_ttl,
+        check=config.archive_check,
+        wallclock=wallclock,
+    )
+
+
 class Relay:
-    def __init__(self, config: Config, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self, config: Config, clock: Callable[[], float] = time.monotonic,
+        archive: Archive | None = None,
+    ) -> None:
         self.config = config
         self.clock = clock
+        # Opened by the caller (main, tests): a broken archive must stop startup.
+        self.archive = archive
+        self.chat_filter = load_chat_filter(config)
+        self.archive_budget = _bucket(config.archive_rate, config.archive_burst, clock)
         self.store = Store(
             retention_seconds=config.retention_seconds,
             max_sessions=config.max_sessions,
@@ -228,6 +276,13 @@ class Relay:
                 "maxBodyBytes": config.echo_max_body_bytes,
                 "chat": config.echo_chat_enabled,
             }
+        if archive is not None:
+            self.info["archive"] = {
+                "days": config.archive_days,
+                "intervalSeconds": config.archive_interval,
+                "ownerDaily": config.archive_owner_daily,
+                "cellDaily": config.archive_cell_daily,
+            }
         self.routes = {
             "/healthz": {"GET": self.healthz},
             "/v1/info": {"GET": self.get_info},
@@ -240,6 +295,7 @@ class Relay:
             self.routes["/v1/echoes/clip"] = {"PUT": self.put_clip}
             self.routes["/v1/echoes/next"] = {"POST": self.next_echo}
             self.routes["/v1/echoes"] = {"DELETE": self.delete_echoes}
+            self.routes["/v1/archive/forget"] = {"POST": self.forget_archive}
 
     def body_limit(self, path: str) -> int:
         """Largest accepted body for ``path``; only clip uploads exceed the default."""
@@ -331,8 +387,10 @@ class Relay:
 
     def create_session(self, req: Request) -> Response:
         obj = parse_json_object(req)
-        _only_keys(obj, {"protocol"}, {"capabilities"})
+        _only_keys(obj, {"protocol"}, {"capabilities", "owner", "account"})
         _protocol(obj)
+        owner = owner_hash(_string(obj, "owner", TOKEN_RE, 64, 64)) if "owner" in obj else None
+        account = _string(obj, "account", UUID_RE, 36, 36) if "account" in obj else ""
         caps: list = []
         if "capabilities" in obj:
             caps = obj["capabilities"]
@@ -368,7 +426,8 @@ class Relay:
             self._check_network_room(req.client)
             _spend(self.global_creates)
             try:
-                token, _ = self.store.create_session(presence=presence, net=req.client, echoes=echoes, chat=chat)
+                token, _ = self.store.create_session(
+                    presence=presence, net=req.client, echoes=echoes, chat=chat, owner=owner, account=account)
             except CapacityError:
                 raise HttpError(503, "capacity", {"Retry-After": str(self.config.retention_seconds)}) from None
         except HttpError:
@@ -467,7 +526,7 @@ class Relay:
         if "chat" in obj:
             if not session.chat:
                 raise HttpError(403, "capability_not_granted")
-            lines, chat_hash = _chat(obj["chat"], session.last_chat, frames[-1][0])
+            lines, chat_hash = _chat(obj["chat"], session.last_chat, frames[-1][0], self.chat_filter)
         self._check_network(req, session)
         since = self.clock() - session.last_publish
         if since < self.config.echo_publish_interval:
@@ -481,10 +540,32 @@ class Relay:
             self.store.publish_clip(session, realm, profile, instance, x, y, z, body, chat, chat_hash, req.client)
         except AreaFullError:
             raise HttpError(503, "area_full", {"Retry-After": str(self.config.echo_ttl)}) from None
+        archived = self._archive(session, account, realm, profile, instance, x, y, z, frames, actions, body, chat)
         return Response(200, {
             "expiresInSeconds": self.config.echo_ttl,
             "chat": len(lines) if lines else 0,
+            "archived": archived,
         })
+
+    def _archive(self, session, account, realm, profile, instance, x, y, z, frames, actions, body, chat) -> bool:
+        """Sample the clip into the archive; every refusal is silent (archived: false)."""
+        archive = self.archive
+        if archive is None or archive.failed or session.owner is None:
+            return False
+        if session.account and session.account != account:
+            return False
+        # Standing still with nothing done is not worth keeping for months.
+        if not actions and max(max(abs(f[1]), abs(f[2]), abs(f[3])) for f in frames) < 32:
+            return False
+        budget = self.archive_budget
+        if budget is not None and budget.take() > 0:
+            return False
+        cid = archive.admit(session.owner, account, realm, profile, Store.instance_key(instance),
+                            x, y, z, body, chat)
+        if cid is None:
+            return False
+        self.store.link_archive(session, cid)
+        return True
 
     def next_echo(self, req: Request) -> Response:
         session = self._echo_session(req)
@@ -498,6 +579,8 @@ class Relay:
         _spend(self.global_echoes)
         echo = self.store.next_echo(session, realm, profile, instance, x, y, z, req.client)
         if echo is None:
+            echo = self._archived_echo(session, realm, profile, instance, x, y, z)
+        if echo is None:
             return Response(200, {"echo": None})
         clip = json.loads(echo.body)
         out = {
@@ -508,9 +591,49 @@ class Relay:
             "x": echo.x, "y": echo.y, "z": echo.z,
             **clip,
         }
-        if echo.chat is not None:
-            out["chat"] = json.loads(echo.chat)
+        if echo.chat is not None and session.chat:
+            lines = json.loads(echo.chat)
+            # Lists may have grown since the line was stored: check again.
+            if self.chat_filter is not None:
+                lines = [line for line in lines if not self.chat_filter.blocked(line[1])]
+            if lines:
+                out["chat"] = lines
         return Response(200, {"echo": out})
+
+    def _archived_echo(self, session, realm, profile, instance, x, y, z) -> Echo | None:
+        archive = self.archive
+        if archive is None or archive.failed:
+            return None
+        found = archive.pick(
+            realm, profile, x, y, z,
+            exclude_owner=session.owner, exclude_account=session.account or None,
+            exclude_instance=Store.instance_key(instance),
+            delivered=lambda cid: self.store.was_delivered(session, cid),
+        )
+        if found is None:
+            return None
+        self.store.mark_delivered(session, found.id, ARCHIVE_SEEN)
+        return Echo(self.store.archived_ref(session, found.id), max(0.0, archive.now() - found.created),
+                    found.x, found.y, found.z, found.body, found.chat if session.chat else None, found.id)
+
+    def forget_archive(self, req: Request) -> Response:
+        """Private deletion by owner secret, from any network, without a session."""
+        obj = parse_json_object(req)
+        _only_keys(obj, {"protocol", "owner", "scope"})
+        _protocol(obj)
+        owner = owner_hash(_string(obj, "owner", TOKEN_RE, 64, 64))
+        scope = obj["scope"]
+        if scope not in ("all", "chat"):
+            raise HttpError(400, "invalid_scope")
+        chat_only = scope == "chat"
+        removed = 0
+        if self.archive is not None:
+            try:
+                removed = self.archive.forget(owner, chat_only)
+            except ArchiveError:
+                raise HttpError(503, "archive_unavailable", {"Retry-After": "300"}) from None
+        self.store.forget_owner(owner, chat_only)
+        return Response(200, {"removed": removed})
 
     def delete_echoes(self, req: Request) -> Response:
         # Withdrawal is always allowed, from any network, like DELETE /v1/session.
@@ -519,6 +642,8 @@ class Relay:
 
     def purge(self) -> None:
         self.store.purge(limit=self.config.purge_batch)
+        if self.archive is not None:
+            self.archive.purge(self.config.archive_purge_batch)
 
 
 # -- echo clip validation ----------------------------------------------------
@@ -597,7 +722,7 @@ def _chat_char_ok(ch: str) -> bool:
     return ch != "\u00a7" and unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp")
 
 
-def _chat(raw, last_hash: bytes, end: int) -> tuple[list, bytes | None]:
+def _chat(raw, last_hash: bytes, end: int, words: Filter | None = None) -> tuple[list, bytes | None]:
     """Validate chat lines; returns the lines worth storing and the new duplicate key."""
     if not isinstance(raw, list) or len(raw) > CLIP_MAX_CHAT:
         raise HttpError(400, "invalid_chat")
@@ -617,6 +742,9 @@ def _chat(raw, last_hash: bytes, end: int) -> tuple[list, bytes | None]:
         digest = hashlib.sha256(text.casefold().encode("utf-8")).digest()[:16]
         # Spam filter: links, long repeats and duplicates are silently dropped.
         if CHAT_LINK_RE.search(text) or CHAT_REPEAT_RE.search(text) or digest in (last_hash, key):
+            continue
+        # Insults and slurs: the whole line is dropped before storage.
+        if words is not None and words.blocked(text):
             continue
         kept.append([t, text])
         key = digest
@@ -868,8 +996,8 @@ class HttpServer:
             return keep_alive
 
 
-async def serve(config: Config) -> None:
-    server = HttpServer(Relay(config))
+async def serve(config: Config, archive: Archive | None = None) -> None:
+    server = HttpServer(Relay(config, archive=archive))
     port = await server.start()
     log.info(
         "noctis-relay %s listening on %s:%d (presence=%s, retention=%ss)",
@@ -889,6 +1017,8 @@ async def serve(config: Config) -> None:
             pass
     await stop.wait()
     await server.stop()
+    if archive is not None:
+        archive.close()
     log.info("stopped; all sessions discarded")
 
 
@@ -899,5 +1029,13 @@ def main() -> int:
     except ConfigError as exc:
         log.error("configuration error: %s", exc)
         return 2
-    asyncio.run(serve(config))
+    try:
+        archive = open_archive(config)
+    except ArchiveError as exc:
+        # Never reset or recreate: the operator inspects the file first.
+        log.error("archive error: %s", exc)
+        return 2
+    if archive is not None:
+        log.info("archive: %d clips kept for %d days", archive.rows, config.archive_days)
+    asyncio.run(serve(config, archive))
     return 0

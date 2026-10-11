@@ -146,3 +146,25 @@ within the load noise of the earlier heavy-load runs.
   on the target machine with the same scripts.
 - Beyond that, the next steps are sharding by realm/profile across processes
   or a different store; this version does not attempt it.
+
+## 2026-10-11 — relay 0.4.0 durable archive (`bench_archive.py`), same machine, load ≈ 13
+
+`python3 bench/bench_archive.py --check`: on-disk archive, WAL,
+`synchronous=FULL` for every measured operation (the fill alone uses NORMAL).
+120 000 clips spread over 92 days, 5 000 owners (one heavy owner with 1 clip in
+50), 30 % in one 96-block square, the rest over 20 000 × 20 000 blocks,
+surface and caves. Simulated clock; nothing leaves the machine.
+
+| Measure | Result |
+|---|---|
+| Fill | 120 000 clips in 16.3 s, 71.9 MB on disk (≈ 600 B per clip) |
+| Lookup, hot square, p50 / p99 | 0.30 / 0.46 ms; 2 000 / 2 000 served, 1 593 distinct accounts |
+| Lookup, dispersed, p50 / p99 | 0.09 / 0.21 ms; 1 078 / 2 000 served |
+| Age of served clips p10 / p50 / p90 | 9 / 47 / 83 days (old visits still appear) |
+| Index entries read per lookup | ≤ 800 (8 per cell from a random pivot) |
+| Query plans | `clip_cell` (realm, profile, cx, cz, cy, shuffle), `clip_created`, `clip_owner`; no table scan |
+| Private deletion of the heavy owner | 2 426 clips in 88 ms, then WAL truncated |
+| Expiry purge a month later | 192 batches of ≤ 200 rows in 2.9 s, batch p99 27 ms |
+
+The default purge batch is 200 rows (`NOCTIS_ARCHIVE_PURGE_BATCH`) so that one
+pass stays far below the request deadlines of the single event loop.

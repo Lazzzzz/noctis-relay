@@ -92,6 +92,27 @@ connexions lentes côté Caddy, on peut placer en tête de
 `{ servers { timeouts { read_header 5s read_body 10s idle 60s } } }`. Ce réglage n'a pas été testé avec ce dépôt ; le relais applique
 de toute façon ses propres délais et limites par client réel.
 
+### Archive durable (optionnelle)
+
+À activer seulement après avoir publié la notice correspondante
+([PRIVACY.md](PRIVACY.md), révision 4).
+
+```sh
+install -d -m 700 -o 10001 -g 10001 ./data   # seul chemin inscriptible du conteneur
+# .env : NOCTIS_ECHOES=1  NOCTIS_ARCHIVE_PATH=/data/archive.db
+docker compose up -d --build
+```
+
+Le conteneur reste en lecture seule et non root (uid 10001) ; `./data` est
+monté sur `/data` (`deploy/compose.traefik.yaml` monte
+`../data` de même). Le fichier est créé en 0600 avec ses compagnons
+`-wal`/`-shm`, ignorés par Git. Un fichier au schéma inconnu ou illisible
+arrête le relais (code 2) : il n'est **jamais** réinitialisé ; le déplacer à
+la main pour repartir d'une archive vide. Plafonds par défaut : 4 millions de
+clips et 16 Gio (`NOCTIS_ARCHIVE_MAX_CLIPS`, `NOCTIS_ARCHIVE_MAX_MB`), refus
+au-delà sans éviction. Les sauvegardes de `./data` conservent des données que
+les joueurs ont pu supprimer : les chiffrer et les expirer dans le même délai.
+
 ### Exploitation
 
 - Mise à jour : `git pull && docker compose --profile https up -d --build`.
@@ -190,6 +211,28 @@ earlier at Caddy, a global options block can be put at the top of
 `deploy/Caddyfile`: `{ servers { timeouts { read_header 5s read_body 10s idle 60s } } }`. This setting
 was not tested with this repository; the relay applies its own deadlines and
 per-real-client limits regardless.
+
+### Durable archive (optional)
+
+Enable it only after publishing the matching notice
+([PRIVACY.md](PRIVACY.md), revision 4).
+
+```sh
+install -d -m 700 -o 10001 -g 10001 ./data   # the container's only writable path
+# .env: NOCTIS_ECHOES=1  NOCTIS_ARCHIVE_PATH=/data/archive.db
+docker compose up -d --build
+```
+
+The container stays read-only and non-root (uid 10001); `./data` is mounted on
+`/data` (`deploy/compose.traefik.yaml` mounts
+`../data` the same way).
+The file is created with mode 0600 together with its `-wal`/`-shm` companions,
+which Git ignores. A file with an unknown schema or that cannot be read stops
+the relay (exit code 2): it is **never** reset; move it away by hand to start
+an empty archive. Default caps: 4 million clips and 16 GiB
+(`NOCTIS_ARCHIVE_MAX_CLIPS`, `NOCTIS_ARCHIVE_MAX_MB`), refusing beyond them
+without eviction. Backups of `./data` keep data players may have deleted:
+encrypt them and let them expire within the same period.
 
 ### Operations
 

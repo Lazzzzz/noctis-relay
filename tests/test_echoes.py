@@ -47,7 +47,7 @@ class EchoApiTest(unittest.TestCase):
 
     def test_info_and_capability_negotiation(self):
         _, info, _ = self.r.request("GET", "/v1/info")
-        self.assertEqual(info["privacyRevision"], 3)
+        self.assertEqual(info["privacyRevision"], 4)
         self.assertEqual(info["capabilities"], ["sessions", "echoes", "chat"])
         self.assertTrue(info["echoes"]["chat"])
         status, body, _ = self.r.request("POST", "/v1/sessions", {"protocol": 1, "capabilities": ["chat"]})

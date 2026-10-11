@@ -15,17 +15,23 @@ l'opérateur :
   joueurs volontaires proches d'**autres** parties rejouent brièvement, de façon
   purement décorative ; sous-capacité `chat` (`NOCTIS_ECHO_CHAT=1`) pour ≤ 2
   lignes de chat public par clip, avec un accord séparé du joueur ;
+- archive durable (`NOCTIS_ARCHIVE_PATH`, avec `echoes`) : un échantillon de
+  clips gardé sur disque 92 jours, rejoué après le départ de son auteur et
+  supprimable par lui seul grâce à une clé de propriétaire privée ; le chat
+  des échos passe par un filtre FR/EN hors ligne ;
 - `presence` (expérimental) : mise en relation de positions proches, sans
   gameplay promis.
 
 Activer `echoes` change les données traitées : lire [PRIVACY.md](PRIVACY.md)
-(révision 3) et publier sa propre notice avant.
+(révision 4) et publier sa propre notice avant.
 
 - Python ≥ 3.11, bibliothèque standard uniquement (aucune dépendance).
-- SQLite **en mémoire** : rien n'est écrit sur disque, tout disparaît au
-  redémarrage. Voir [PRIVACY.md](PRIVACY.md).
+- SQLite **en mémoire** pour les sessions et les clips en direct : tout
+  disparaît au redémarrage. Seule l'archive optionnelle est écrite sur disque
+  (fichier 0600, WAL ; un fichier inconnu ou abîmé arrête le relais sans
+  jamais être réinitialisé). Voir [PRIVACY.md](PRIVACY.md).
 - Un seul processus, une seule boucle asyncio qui possède la connexion SQLite :
-  aucune concurrence d'écriture, pas besoin de WAL.
+  aucune concurrence d'écriture.
 - Protocole : [PROTOCOL.md](PROTOCOL.md). Mesures : [BENCHMARKS.md](BENCHMARKS.md).
   Mise en ligne sur un VPS (OVH ou autre) : [DEPLOY.md](DEPLOY.md).
 
@@ -47,6 +53,7 @@ python3 -m unittest discover -s tests -t . -v
 python3 bench/bench_spatial.py && python3 bench/bench_http.py
 python3 bench/bench_abuse.py --attack rotate   # players under hostile load
 python3 bench/bench_echoes.py                  # échos : index et purge, sans HTTP
+python3 bench/bench_archive.py --check         # archive : 120 000 clips, recherche, oubli, purge
 NOCTIS_ECHOES=1 NOCTIS_ECHO_CHAT=1 NOCTIS_CREATE_BURST=8 python3 -m noctis_relay &
 python3 bench/smoke_echoes.py                  # échos de bout en bout sur HTTP
 ```
@@ -100,17 +107,23 @@ default, are enabled by the operator:
   players of **other** games nearby briefly replay, purely cosmetically; a
   `chat` sub-capability (`NOCTIS_ECHO_CHAT=1`) carries ≤ 2 public chat lines
   per clip under a separate player choice;
+- durable archive (`NOCTIS_ARCHIVE_PATH`, with `echoes`): a sample of clips
+  kept on disk for 92 days, replayed after its author left and deletable by
+  them alone with a private owner key; echo chat goes through an offline
+  FR/EN filter;
 - `presence` (experimental): matching of nearby positions, with no gameplay
   promised.
 
 Enabling `echoes` changes the data you handle: read [PRIVACY.md](PRIVACY.md)
-(revision 3) and publish your own notice first.
+(revision 4) and publish your own notice first.
 
 - Python ≥ 3.11, standard library only (no dependencies).
-- **In-memory** SQLite: nothing is written to disk and everything is gone after
-  a restart. See [PRIVACY.md](PRIVACY.md).
+- **In-memory** SQLite for sessions and live clips: all gone after a restart.
+  Only the optional archive is written to disk (mode 0600, WAL; an unknown or
+  damaged file stops the relay and is never reset). See
+  [PRIVACY.md](PRIVACY.md).
 - One process, one asyncio loop owning the SQLite connection: no writer
-  contention, no WAL needed.
+  contention.
 - Protocol: [PROTOCOL.md](PROTOCOL.md). Measurements:
   [BENCHMARKS.md](BENCHMARKS.md). VPS deployment (OVH or other):
   [DEPLOY.md](DEPLOY.md).
@@ -133,6 +146,7 @@ python3 -m unittest discover -s tests -t . -v
 python3 bench/bench_spatial.py && python3 bench/bench_http.py
 python3 bench/bench_abuse.py --attack rotate   # players under hostile load
 python3 bench/bench_echoes.py                  # echoes: index and purge, no HTTP
+python3 bench/bench_archive.py --check         # archive: 120,000 clips, lookups, forget, purge
 NOCTIS_ECHOES=1 NOCTIS_ECHO_CHAT=1 NOCTIS_CREATE_BURST=8 python3 -m noctis_relay &
 python3 bench/smoke_echoes.py                  # echoes end to end over HTTP
 ```
@@ -179,6 +193,9 @@ All settings are environment variables; see [.env.example](.env.example).
 values stop the relay at startup.
 
 ## License
+
+For removable fictional action clips using the ordinary API, see
+[the demonstration tool](tools/README.md).
 
 MIT, see [LICENSE](LICENSE). This repository contains only the relay; the
 Noctis game client is a separate, non-free project.

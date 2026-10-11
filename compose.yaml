@@ -15,6 +15,12 @@ services:
     ports:
       - "${NOCTIS_PUBLISH:-127.0.0.1}:${NOCTIS_HOST_PORT:-8787}:8787"
     read_only: true
+    # The only writable path: the archive (NOCTIS_ARCHIVE_PATH=/data/archive.db).
+    # Create it once with: install -d -m 700 -o 10001 -g 10001 ./data
+    volumes:
+      - ./data:/data
+    tmpfs:
+      - /tmp:size=16m,mode=1777
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     pids_limit: 64

@@ -11,3 +11,7 @@ dist/
 
 deploy/config/
 deploy/operator-config/
+*.db-wal
+*.db-shm
+*.db-journal
+data/

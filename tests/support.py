@@ -57,10 +57,11 @@ def free_port() -> int:
 
 
 class RunningRelay:
-    def __init__(self, config: Config, clock: FakeClock | None = None, dual_stack: bool = False) -> None:
+    def __init__(self, config: Config, clock: FakeClock | None = None, dual_stack: bool = False,
+                 archive=None) -> None:
         """``dual_stack`` also listens on ::1 (same port) for a second real peer."""
         self.clock = clock or FakeClock()
-        self.relay = Relay(config, clock=self.clock)
+        self.relay = Relay(config, clock=self.clock, archive=archive)
         self.server = HttpServer(self.relay)
         self.loop = asyncio.new_event_loop()
         ready = threading.Event()

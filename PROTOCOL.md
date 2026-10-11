@@ -32,12 +32,12 @@ they answer `404`.
 ```json
 {
   "protocol": 1,
-  "privacyRevision": 3,
+  "privacyRevision": 4,
   "retentionSeconds": 30,
   "heartbeatSeconds": 10,
   "operator": {"name": "Example relay", "contact": "relay-admin@example.org"},
   "capabilities": ["sessions"],
-  "server": {"name": "noctis-relay", "version": "0.3.0"}
+  "server": {"name": "noctis-relay", "version": "0.4.0"}
 }
 ```
 
@@ -52,7 +52,10 @@ echoes and chat capabilities below; routes and bodies of the earlier protocol 1
 features are unchanged. With echoes enabled, `capabilities` also lists
 `"echoes"` (and `"chat"` when enabled) and an `echoes` object gives
 `ttlSeconds`, `radius`, `vertical`, `publishIntervalSeconds`,
-`fetchIntervalSeconds`, `maxBodyBytes` and `chat`.
+`fetchIntervalSeconds`, `maxBodyBytes` and `chat`. Revision 4 (relay 0.4.0)
+adds the optional durable archive: when it is enabled an `archive` object gives
+`days`, `intervalSeconds`, `ownerDaily` and `cellDaily` (see
+[Archive](#archive)).
 
 ### Sessions
 
@@ -298,3 +301,74 @@ of anything and must stay cosmetic on the receiving side: no block change,
 entity, command or game decision may depend on them. Receiving clients should
 check every block action against their own world before showing it and fetch
 names and skins only from the official account service.
+
+## Archive
+
+Optional, operator-enabled (`NOCTIS_ARCHIVE_PATH`, needs echoes). The relay
+then keeps a **sample** of echo clips on disk for `days` (92 by default) and
+serves them to nearby observers when no live clip is available, also after
+their author left. The `archive` object in `/v1/info` announces it:
+
+```json
+"archive": {"days": 92, "intervalSeconds": 300, "ownerDaily": 48, "cellDaily": 24}
+```
+
+### Owner key at session creation
+
+```json
+{"protocol": 1, "capabilities": ["echoes"],
+ "owner": "<64 lowercase hex>", "account": "0f1e2d3c-4b5a-4968-8776-655443322110"}
+```
+
+Both fields are optional. `owner` is a random 32-byte secret chosen by the
+client, one per relay address and account, kept private and sent only to the
+relay it belongs to. The relay stores only `sha256(owner)[:16]`. `account` binds
+the session: a clip whose `account` differs is never archived. Without `owner`
+nothing of the session is archived.
+
+### Sampling
+
+`PUT /v1/echoes/clip` answers `"archived": true|false`. `false` is ordinary
+sampling, not an error, and promises nothing. A clip is archived only when it
+moves at least one block or holds an action, at most once per
+`intervalSeconds` and `ownerDaily` times a day per owner, `cellDaily` times a
+day per 16-block cell, below `NOCTIS_ARCHIVE_CELL_MAX` clips per cell and below
+the operator's row and byte caps (a full archive refuses; it never evicts
+older clips). A relay-wide write budget also applies.
+
+### Serving
+
+`POST /v1/echoes/next` returns a live clip first, otherwise an archived one in
+the same area, with the same body format. `ageSeconds` may then reach
+`days × 86400`; a client accepts such ages only from a relay that announces an
+archive. Archived clips never come from the observer's own owner, account or
+game instance (the instance fingerprint is `sha256(instance)[:16]`, stable
+across relay restarts), are older than the live lifetime, and are served at
+most once per observer session (records kept 6 hours). Selection reads at most
+`per_cell` (8) index entries per cell from a random pivot, so busy places and
+old visits both appear. Chat is served only to chat sessions and is filtered
+again when served.
+
+### `POST /v1/archive/forget`
+
+No session or token. Body:
+
+```json
+{"protocol": 1, "owner": "<64 hex>", "scope": "all"}
+```
+
+`scope` is `all` (every archived clip of the owner, plus its live sessions and
+clips) or `chat` (chat lines only, archived and live; the live chat grant is
+revoked). Answers `200 {"removed": n}`, also when nothing matched (idempotent)
+and on relays without archive. `400` for an invalid body. `503
+archive_unavailable` with `Retry-After` while the archive cannot be written;
+the client keeps the request and retries. The route exists whenever echoes are
+enabled; there is no listing or administrative route.
+
+### Failure
+
+The archive file is created with mode 0600 and WAL journal. A file with an
+unknown schema or that SQLite cannot open stops the relay at start (exit code
+2); it is never reset or rewritten. A runtime database error disables the
+archive (no archiving, no archived serving, forget answers 503) until restart;
+live echoes continue.
