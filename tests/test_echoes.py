@@ -109,6 +109,20 @@ class EchoApiTest(unittest.TestCase):
         other["profile"] = "terrain-ffffffffffffffff"
         self.assertIsNone(self.r.request("POST", "/v1/echoes/next", other, token=b)[1]["echo"])
 
+    def test_origin_preserves_block_boundaries(self):
+        # Block action offsets use floor(origin), so even millimetre rounding
+        # changes their world block near a positive or negative boundary.
+        a, b = self.session(), self.session()
+        for x, y, z in ((0.9998, 64.9998, -0.0002),
+                        (-1.0002, -0.0002, 1.9998),
+                        (29_999_999.9998, 4095.9998, -29_999_999.9998)):
+            self.r.clock.advance(2)
+            body = clip(x=x, y=y, z=z, actions=[[2, 2, 1, 0, 0, "minecraft:stone"]])
+            self.assertEqual(self.publish(a, body)[0], 200)
+            status, payload, _ = self.fetch(b, x=x, y=y, z=z)
+            self.assertEqual(status, 200)
+            self.assertEqual([payload["echo"][k] for k in ("x", "y", "z")], [x, y, z])
+
     def test_withdraw_and_logout_remove_clip_immediately(self):
         a, b, c = self.session(), self.session(), self.session()
         self.publish(a, clip())
@@ -224,6 +238,20 @@ class EchoApiTest(unittest.TestCase):
             self.assertEqual(self.publish(a, clip(account=account))[1]["error"], "invalid_account")
         self.assertEqual(self.publish(a, clip(name="Notch"))[1]["error"], "invalid_fields")
         self.assertEqual(self.publish(a, clip(skin="http://evil/skin.png"))[1]["error"], "invalid_fields")
+
+    def test_action_reach_uses_exact_origin(self):
+        a = self.session()
+        stationary = [[0, 0, 0, 0, 64, 0, 64, 1], [2, 0, 0, 0, 64, 0, 64, 1]]
+        # A block 6.49 blocks from the eyes is reachable; ignoring the origin's
+        # fractional part would incorrectly put its centre beyond 6.5.
+        body = clip(x=0.01, y=64.99, z=0.5, frames=stationary,
+                    actions=[[2, 1, 6, 2, 0, "minecraft:stone"]])
+        self.assertEqual(self.publish(a, body)[0], 200)
+        self.r.clock.advance(2)
+        # Conversely, a block on the other side exceeds 6.5 in real space.
+        body = clip(x=0.99, y=64.99, z=0.99, frames=stationary,
+                    actions=[[2, 1, -6, 1, 0, "minecraft:stone"]])
+        self.assertEqual(self.publish(a, body)[1]["error"], "implausible_action")
 
     def test_route_body_limit(self):
         a = self.session()

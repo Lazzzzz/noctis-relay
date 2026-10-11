@@ -461,7 +461,7 @@ class Relay:
         realm, profile, instance, x, y, z = self._place(obj)
         account = _string(obj, "account", UUID_RE, 36, 36)
         frames = _frames(obj["frames"], self.config)
-        actions = _actions(obj.get("actions", []), frames)
+        actions = _actions(obj.get("actions", []), frames, (x, y, z))
         lines = None
         chat_hash = None
         if "chat" in obj:
@@ -503,7 +503,9 @@ class Relay:
         out = {
             "ref": echo.ref,
             "ageSeconds": round(echo.age, 1),
-            "x": round(echo.x, 3), "y": round(echo.y, 3), "z": round(echo.z, 3),
+            # Integer block offsets are relative to floor(origin). Rounding
+            # near a block boundary would move every replayed action one block.
+            "x": echo.x, "y": echo.y, "z": echo.z,
             **clip,
         }
         if echo.chat is not None:
@@ -560,10 +562,13 @@ def _frames(raw, config: Config) -> list:
     return out
 
 
-def _actions(raw, frames: list) -> list:
+def _actions(raw, frames: list, origin: tuple) -> list:
     if not isinstance(raw, list) or len(raw) > CLIP_MAX_ACTIONS:
         raise HttpError(400, "invalid_actions")
     end = frames[-1][0]
+    # Integer offsets use the origin's containing block; frames use its exact
+    # position. Convert the block centre to that same relative coordinate space.
+    fx, fy, fz = (v - math.floor(v) for v in origin)
     out = []
     for item in raw:
         if not isinstance(item, list) or len(item) != 6:
@@ -575,7 +580,7 @@ def _actions(raw, frames: list) -> list:
         if not isinstance(block, str) or not BLOCK_RE.fullmatch(block):
             raise HttpError(400, "invalid_block")
         # The block must be within reach of the replayed body near that tick.
-        cx, cy, cz = bx + 0.5, by + 0.5, bz + 0.5
+        cx, cy, cz = bx + 0.5 - fx, by + 0.5 - fy, bz + 0.5 - fz
         if not any(
             abs(f[0] - t) <= 10
             and math.dist((f[1] / 32.0, f[2] / 32.0 + 1.5, f[3] / 32.0), (cx, cy, cz)) <= CLIP_ACTION_REACH

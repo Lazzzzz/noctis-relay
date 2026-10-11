@@ -247,6 +247,9 @@ session without `chat` gets the same error.
   `400 implausible_movement`.
 - `actions` (optional): ≤ 8 arrays `[t, kind, bx, by, bz, block]`, `kind`
   1 break / 2 place, block offsets ±64, `block` a `namespace:path` id. Each
+  offset is relative to the block containing the origin: the world position is
+  `(floor(x)+bx, floor(y)+by, floor(z)+bz)`. The origin is transmitted without
+  rounding, including at negative coordinates and block boundaries. An action
   must be within 6.5 blocks of the body's eyes within 10 ticks
   (`400 implausible_action`).
 - `chat` (optional, needs `chat`): ≤ 2 arrays `[t, text]`, 1–64 characters,
