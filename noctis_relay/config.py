@@ -127,12 +127,30 @@ class Config:
     near_limit: int = 8
     # Live positions in one spatial cell (0 = off); bounds dense-zone queries.
     presence_max_per_cell: int = 64
+    # Optional echoes capability (short replayed movement clips, off by
+    # default) and its separate chat sub-capability (off by default).
+    echoes_enabled: bool = False
+    echo_chat_enabled: bool = False
+    echo_ttl: int = 60
+    echo_radius: int = 48
+    echo_vertical: int = 16
+    echo_max_per_cell: int = 32
+    echo_max_body_bytes: int = 6144
+    echo_publish_interval: float = 20.0
+    echo_fetch_interval: float = 20.0
+    # Fastest accepted movement in a clip, in blocks per tick.
+    echo_max_speed: float = 1.2
+    echo_max_vertical_speed: float = 4.0
+    global_echo_rate: float = 200.0
+    global_echo_burst: int = 400
 
     def __post_init__(self) -> None:
         if self.heartbeat_seconds * 2 > self.retention_seconds:
             raise ConfigError("NOCTIS_HEARTBEAT_SECONDS must be at most half of NOCTIS_RETENTION_SECONDS")
         if self.session_binding not in ("migrate", "strict"):
             raise ConfigError("NOCTIS_SESSION_BINDING must be migrate or strict")
+        if self.echo_chat_enabled and not self.echoes_enabled:
+            raise ConfigError("NOCTIS_ECHO_CHAT requires NOCTIS_ECHOES")
 
 
 def load_deny_file(path: str) -> list:
@@ -199,4 +217,17 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         near_vertical=_int(env, "NOCTIS_NEAR_VERTICAL", 12, 0, 256),
         near_limit=_int(env, "NOCTIS_NEAR_LIMIT", 8, 1, 32),
         presence_max_per_cell=_int(env, "NOCTIS_PRESENCE_MAX_PER_CELL", 64, 0, 100_000),
+        echoes_enabled=_bool(env, "NOCTIS_ECHOES", False),
+        echo_chat_enabled=_bool(env, "NOCTIS_ECHO_CHAT", False),
+        echo_ttl=_int(env, "NOCTIS_ECHO_TTL", 60, 10, 120),
+        echo_radius=_int(env, "NOCTIS_ECHO_RADIUS", 48, 8, 128),
+        echo_vertical=_int(env, "NOCTIS_ECHO_VERTICAL", 16, 0, 128),
+        echo_max_per_cell=_int(env, "NOCTIS_ECHO_MAX_PER_CELL", 32, 0, 100_000),
+        echo_max_body_bytes=_int(env, "NOCTIS_ECHO_MAX_BODY_BYTES", 6144, 1024, 16_384),
+        echo_publish_interval=_float(env, "NOCTIS_ECHO_PUBLISH_INTERVAL", 20.0, 1.0, 3600.0),
+        echo_fetch_interval=_float(env, "NOCTIS_ECHO_FETCH_INTERVAL", 20.0, 1.0, 3600.0),
+        echo_max_speed=_float(env, "NOCTIS_ECHO_MAX_SPEED", 1.2, 0.1, 4.0),
+        echo_max_vertical_speed=_float(env, "NOCTIS_ECHO_MAX_VERTICAL_SPEED", 4.0, 0.1, 8.0),
+        global_echo_rate=_float(env, "NOCTIS_GLOBAL_ECHO_RATE", 200.0, 0.0, 1_000_000.0),
+        global_echo_burst=_int(env, "NOCTIS_GLOBAL_ECHO_BURST", 400, 1, 10_000_000),
     )

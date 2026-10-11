@@ -27,6 +27,24 @@ jobs:
         run: python bench/bench_http.py --clients 50 --seconds 3
       - name: Players under a rotating flood, default limits (smoke)
         run: python bench/bench_abuse.py --attack rotate --players 50 --attackers 16 --warmup 1.5 --seconds 4 --check
+      - name: Echo HTTP traffic under a rotating flood, accelerated pacing (smoke)
+        run: python -W error::ResourceWarning bench/bench_echo_http.py --attack rotate --seconds 5 --check
+      - name: Echo HTTP traffic under invalid clips, accelerated pacing (smoke)
+        run: python -W error::ResourceWarning bench/bench_echo_http.py --attack invalid --seconds 5 --check
+      - name: Echo store benchmark (smoke)
+        run: python bench/bench_echoes.py --players 2000 --hot 200 --lookups 5000
+      - name: Echoes over HTTP, real relay process (smoke)
+        env:
+          NOCTIS_OPERATOR_NAME: CI
+          NOCTIS_OPERATOR_CONTACT: ci@example.invalid
+          NOCTIS_PORT: "8787"
+          NOCTIS_ECHOES: "1"
+          NOCTIS_ECHO_CHAT: "1"
+          NOCTIS_CREATE_BURST: "8"
+        run: |
+          python -m noctis_relay &
+          python bench/smoke_echoes.py --url http://127.0.0.1:8787
+          kill %1
 
   docker:
     runs-on: ubuntu-latest
@@ -42,4 +60,11 @@ jobs:
           for i in $(seq 30); do curl -fsS http://127.0.0.1:8787/healthz && break; sleep 1; done
           curl -fsS http://127.0.0.1:8787/v1/info
           test "$(docker exec relay id -u)" = "10001"
+          docker rm -f relay
+      - name: Echoes smoke in the image
+        run: |
+          docker run -d --name relay --read-only --cap-drop ALL -p 127.0.0.1:8787:8787 \
+            -e NOCTIS_OPERATOR_NAME=CI -e NOCTIS_OPERATOR_CONTACT=ci@example.invalid \
+            -e NOCTIS_ECHOES=1 -e NOCTIS_ECHO_CHAT=1 -e NOCTIS_CREATE_BURST=8 noctis-relay:ci
+          python3 bench/smoke_echoes.py --url http://127.0.0.1:8787 --wait 30
           docker rm -f relay

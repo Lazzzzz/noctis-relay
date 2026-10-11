@@ -27,7 +27,7 @@ class SessionApiTest(unittest.TestCase):
         status, body, _ = self.r.request("GET", "/v1/info")
         self.assertEqual(status, 200)
         self.assertEqual(body["protocol"], 1)
-        self.assertEqual(body["privacyRevision"], 2)
+        self.assertEqual(body["privacyRevision"], 3)
         self.assertEqual(body["retentionSeconds"], 30)
         self.assertEqual(body["heartbeatSeconds"], 10)
         self.assertEqual(body["operator"], {"name": "Test operator", "contact": "relay@example.invalid"})
@@ -63,10 +63,13 @@ class SessionApiTest(unittest.TestCase):
             self.assertNotIn(token.encode(), b"".join(bytes(c) for row in rows for c in row if isinstance(c, bytes)))
         hashes = {row[1] for row in rows}
         self.assertEqual(hashes, {hash_token(t) for t in tokens})
-        # Only id, token hash, expiry, presence flags and a keyed network
-        # fingerprint: no IP, UUID, name.
+        # Only id, token hash, expiry, capability/pacing flags, a keyed network
+        # fingerprint and a chat duplicate hash: no IP, UUID, name.
         cols = [c[1] for c in self.r.call(lambda: self.r.relay.store.db.execute("PRAGMA table_info(session)").fetchall())]
-        self.assertEqual(cols, ["sid", "token_hash", "expires", "presence", "last_presence", "net"])
+        self.assertEqual(cols, [
+            "sid", "token_hash", "expires", "presence", "last_presence", "net",
+            "echoes", "chat", "last_publish", "last_fetch", "last_chat",
+        ])
         nets = {row[5] for row in rows}
         self.assertEqual(len(nets), 1)  # all from 127.0.0.1
         net = nets.pop()

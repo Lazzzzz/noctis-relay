@@ -3,7 +3,8 @@
 All bodies are UTF-8 JSON objects with `Content-Type: application/json` and a
 `Content-Length` (no chunked encoding). Unknown fields, duplicate keys, `NaN`,
 `Infinity`, booleans where numbers are expected and bodies above
-`NOCTIS_MAX_BODY_BYTES` (1024 by default) are rejected. Errors are
+`NOCTIS_MAX_BODY_BYTES` (1024 by default; `NOCTIS_ECHO_MAX_BODY_BYTES`, 6144 by
+default, for `PUT /v1/echoes/clip`) are rejected. Errors are
 `{"error": "<code>"}`. Responses carry `Cache-Control: no-store` and no CORS
 headers: the API is meant for the game client, not for browsers.
 
@@ -18,21 +19,25 @@ headers: the API is meant for the game client, not for browsers.
 | DELETE | `/v1/session` | Bearer | — | `204` (idempotent) |
 | PUT | `/v1/presence` | Bearer + `presence` | see below | `200` |
 | DELETE | `/v1/presence` | Bearer + `presence` | — | `204` |
+| PUT | `/v1/echoes/clip` | Bearer + `echoes` | see below | `200` |
+| POST | `/v1/echoes/next` | Bearer + `echoes` | see below | `200` |
+| DELETE | `/v1/echoes` | Bearer + `echoes` | — | `204` |
 
 The two presence routes only exist when the operator enables
-`NOCTIS_PRESENCE=1`; otherwise they answer `404`.
+`NOCTIS_PRESENCE=1`, the three echo routes when `NOCTIS_ECHOES=1`; otherwise
+they answer `404`.
 
 ### `GET /v1/info`
 
 ```json
 {
   "protocol": 1,
-  "privacyRevision": 2,
+  "privacyRevision": 3,
   "retentionSeconds": 30,
   "heartbeatSeconds": 10,
   "operator": {"name": "Example relay", "contact": "relay-admin@example.org"},
   "capabilities": ["sessions"],
-  "server": {"name": "noctis-relay", "version": "0.2.0"}
+  "server": {"name": "noctis-relay", "version": "0.3.0"}
 }
 ```
 
@@ -42,8 +47,12 @@ it. When presence is enabled, `capabilities` is `["sessions","presence"]` and a
 `privacyRevision` changes whenever the data handled by the server changes; a
 client must ask for consent again when it differs from the one the player
 accepted. Revision 2 (relay 0.2.0) attaches a keyed in-memory fingerprint of
-the client network to each session; the routes and bodies of protocol 1 are
-unchanged.
+the client network to each session. Revision 3 (relay 0.3.0) adds the optional
+echoes and chat capabilities below; routes and bodies of the earlier protocol 1
+features are unchanged. With echoes enabled, `capabilities` also lists
+`"echoes"` (and `"chat"` when enabled) and an `echoes` object gives
+`ttlSeconds`, `radius`, `vertical`, `publishIntervalSeconds`,
+`fetchIntervalSeconds`, `maxBodyBytes` and `chat`.
 
 ### Sessions
 
@@ -89,14 +98,14 @@ waiting `Retry-After` seconds; nothing else is required from them.
 | `400` | `invalid_json`, `invalid_fields`, `invalid_protocol`, `unsupported_protocol`, `invalid_<field>`, `bad_request`, … | Malformed body or request |
 | `401` | `invalid_token`, `session_expired` | Create a new session |
 | `403` | `forbidden` | Network blocked by the operator (connection closed) |
-| `403` | `capability_not_granted` | Presence route without the capability |
+| `403` | `capability_not_granted` | Presence or echo route (or chat lines) without the capability |
 | `404`, `405` (with `Allow`), `411`, `413`, `415`, `417`, `431`, `501` | | HTTP framing errors |
-| `429` | `rate_limited` | Per-network, per-prefix or per-session budget, or presence interval |
+| `429` | `rate_limited` | Per-network, per-prefix or per-session budget, or presence/echo interval |
 | `429` | `too_many_sessions` | Network already holds its maximum of live sessions |
 | `429` | `concurrency_limited` | Too many requests in progress for this network |
 | `503` | `overloaded` | A relay-wide budget is exhausted |
 | `503` | `capacity` | `NOCTIS_MAX_SESSIONS` reached |
-| `503` | `area_full` | Presence cell full (below) |
+| `503` | `area_full` | Presence or echo cell full (below) |
 
 Every `429` and `503` carries `Retry-After` (seconds, ≥ 1). Requests refused
 before their body was read close the connection. Budgets are checked in this
@@ -192,3 +201,97 @@ neighbouring horizontal cell (5×5 by default) with a range on `cy`, then an
 exact distance and height filter. With the per-cell cap, one lookup examines
 at most (2×span+1)² × (vertical cells) × cap live rows (5 × 5 × 3 × 64 = 4 800
 by default), whatever the crowd size. See [BENCHMARKS.md](BENCHMARKS.md).
+
+## Echoes
+
+Echoes are an **opt-in, operator-enabled** capability (`NOCTIS_ECHOES=1`, off
+by default). A player's game uploads a very short clip of its own movement; a
+nearby opted-in player of **another** game later receives it once and replays
+it briefly as a cosmetic apparition. Chat lines are a separate
+sub-capability (`NOCTIS_ECHO_CHAT=1`, off by default) that a client may only
+request when its player accepted it separately.
+
+Request them at session creation; `chat` requires `echoes`:
+
+```json
+{"protocol": 1, "capabilities": ["echoes", "chat"]}
+```
+
+The response lists the granted capabilities. A relay without them answers
+`400 capability_unavailable`; a session without `echoes` gets
+`403 capability_not_granted` on echo routes, and a clip carrying `chat` from a
+session without `chat` gets the same error.
+
+### `PUT /v1/echoes/clip`
+
+```json
+{"realm": "astralyth:noctis", "profile": "noctis-t1-3f9c2a7d0b1e4c55",
+ "instance": "k3J9-random-per-server-run", "x": 120.5, "y": 64.0, "z": -48.25,
+ "account": "0f1e2d3c-4b5a-4968-8776-655443322110",
+ "frames": [[0, 0, 0, 0, 64, 0, 64, 1], [2, 6, 0, 0, 64, 0, 64, 1]],
+ "actions": [[1, 1, 2, 0, 0, "minecraft:stone"]],
+ "chat": [[2, "hello"]]}
+```
+
+- `realm`, `profile`, `instance`, `x`, `y`, `z`: as for presence; `x/y/z` is
+  the clip origin. The game derives `profile` from its terrain generator
+  settings (never the seed) and shares `instance` among all players of one
+  server run, so they never see each other.
+- `account`: lowercase UUID of the Minecraft account. It is **not verified**.
+- `frames`: 2–60 arrays `[t, dx, dy, dz, yaw, pitch, head, flags]`; `t` in
+  ticks (0–120, strictly increasing, first frame `[0,0,0,0,…]`), offsets in
+  1/32 block (±1536), `yaw`/`head` 0–255, `pitch` −64…64, `flags` bits
+  1 ground, 2 crouch, 4 sprint, 8 swing, 16 swim. Steps faster than
+  `NOCTIS_ECHO_MAX_SPEED` (1.2) blocks/tick horizontally or
+  `NOCTIS_ECHO_MAX_VERTICAL_SPEED` (4.0) vertically get
+  `400 implausible_movement`.
+- `actions` (optional): ≤ 8 arrays `[t, kind, bx, by, bz, block]`, `kind`
+  1 break / 2 place, block offsets ±64, `block` a `namespace:path` id. Each
+  must be within 6.5 blocks of the body's eyes within 10 ticks
+  (`400 implausible_action`).
+- `chat` (optional, needs `chat`): ≤ 2 arrays `[t, text]`, 1–64 characters,
+  no controls, format/bidi characters, private use, line separators, `§`,
+  leading/trailing or double spaces (`400 invalid_chat`). Lines with links,
+  long repeats or duplicating the previous line are silently dropped.
+
+Unknown keys, wrong types or out-of-range values are refused as a whole. The
+relay stores the clip re-serialised from validated values, replacing the
+session's previous clip, and answers `{"expiresInSeconds": 60, "chat": <lines
+kept>}`. Uploads closer than `publishIntervalSeconds` get `429`; a clip that
+would enter a cell already holding `NOCTIS_ECHO_MAX_PER_CELL` (32) live clips
+of the same realm and profile gets `503 area_full` and nothing changes.
+
+### `POST /v1/echoes/next`
+
+Body: `realm`, `profile`, `instance`, `x`, `y`, `z` of the observer. Returns
+`{"echo": null}` or the nearest live clip within `radius` blocks horizontally
+and `vertical` blocks vertically, with the same realm and profile, from
+another live session **and** another instance, not yet delivered to this
+session:
+
+```json
+{"echo": {"ref": "9c1f0a3be2d47781", "ageSeconds": 4.2,
+          "x": 120.5, "y": 64.0, "z": -48.25,
+          "account": "0f1e2d3c-4b5a-4968-8776-655443322110",
+          "frames": [...], "actions": [...], "chat": [[2, "hello"]]}}
+```
+
+`chat` is only present when both sessions hold the `chat` capability. `ref`
+is opaque and differs per observer. Each clip is delivered at most once per
+observer; the delivery record expires with the clip. Lookups closer than
+`fetchIntervalSeconds` get `429`. Uploads and lookups both draw from a
+relay-wide echo budget (`503 overloaded`).
+
+### Withdrawal
+
+`DELETE /v1/echoes` removes the session's clip and delivery records at once;
+`DELETE /v1/session` and session expiry do the same. Clips also expire after
+`ttlSeconds`. A clip whose source session ended is never served, even before
+the purge removes it.
+
+**What echoes are not.** Accounts, positions, movements and actions are
+declared by clients; a modified client can invent them. Echoes are not proof
+of anything and must stay cosmetic on the receiving side: no block change,
+entity, command or game decision may depend on them. Receiving clients should
+check every block action against their own world before showing it and fetch
+names and skins only from the official account service.

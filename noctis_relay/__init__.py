@@ -1,6 +1,6 @@
-"""Noctis relay: ephemeral opt-in sessions and optional proximity presence."""
+"""Noctis relay: ephemeral opt-in sessions and optional proximity presence and echoes."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 PROTOCOL = 1
-PRIVACY_REVISION = 2
+PRIVACY_REVISION = 3

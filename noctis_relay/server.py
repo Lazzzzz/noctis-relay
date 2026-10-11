@@ -9,6 +9,7 @@ no chunked encoding, no redirects, no CORS and no access logs.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
@@ -17,6 +18,7 @@ import re
 import signal
 import time
 import traceback
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable
 
@@ -39,7 +41,23 @@ MAX_HEADERS = 32
 MAX_HEAD_BYTES = 8192
 MAX_HORIZONTAL = 30_000_000
 MIN_Y, MAX_Y = -2048, 4096
-KNOWN_CAPABILITIES = ("presence",)
+KNOWN_CAPABILITIES = ("presence", "echoes", "chat")
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+BLOCK_RE = re.compile(r"[a-z0-9_.-]{1,32}:[a-z0-9_./-]{1,64}")
+# Echo clip schema (see PROTOCOL.md). Offsets are in 1/32 block.
+CLIP_MAX_FRAMES = 60
+CLIP_MAX_TICKS = 120
+CLIP_MAX_OFFSET = 1536
+CLIP_MAX_ACTIONS = 8
+CLIP_ACTION_REACH = 6.5
+CLIP_MAX_CHAT = 2
+CHAT_MAX_CHARS = 64
+FRAME_FLAGS = 0b11111  # ground, crouch, sprint, swing, swim
+# Lines that look like links or contact handles are dropped, not stored.
+CHAT_LINK_RE = re.compile(
+    r"(?i)(?:[a-z][a-z0-9+.-]*://|www\.|\b[a-z0-9-]+\.(?:[a-z]{2,24})(?:/|\b)|discord\.gg|@\w{3,})"
+)
+CHAT_REPEAT_RE = re.compile(r"(.)\1{7,}", re.S)
 
 REASONS = {
     200: "OK", 201: "Created", 204: "No Content", 400: "Bad Request", 401: "Unauthorized",
@@ -161,6 +179,10 @@ class Relay:
             near_limit=config.near_limit,
             clock=clock,
             max_per_cell=config.presence_max_per_cell,
+            echo_ttl=config.echo_ttl,
+            echo_radius=config.echo_radius,
+            echo_vertical=config.echo_vertical,
+            echo_max_per_cell=config.echo_max_per_cell,
         )
         self.fingerprints = Fingerprints()
         size = config.rate_table_size
@@ -177,7 +199,9 @@ class Relay:
         self.global_requests = _bucket(config.global_request_rate, config.global_request_burst, clock)
         self.global_creates = _bucket(config.global_create_rate, config.global_create_burst, clock)
         self.global_presence = _bucket(config.global_presence_rate, config.global_presence_burst, clock)
+        self.global_echoes = _bucket(config.global_echo_rate, config.global_echo_burst, clock)
         caps = ["sessions"] + (["presence"] if config.presence_enabled else [])
+        caps += (["echoes"] if config.echoes_enabled else []) + (["chat"] if config.echo_chat_enabled else [])
         self.info = {
             "protocol": PROTOCOL,
             "privacyRevision": PRIVACY_REVISION,
@@ -194,6 +218,16 @@ class Relay:
                 "limit": config.near_limit,
                 "minIntervalSeconds": config.presence_min_interval,
             }
+        if config.echoes_enabled:
+            self.info["echoes"] = {
+                "ttlSeconds": config.echo_ttl,
+                "radius": config.echo_radius,
+                "vertical": config.echo_vertical,
+                "publishIntervalSeconds": config.echo_publish_interval,
+                "fetchIntervalSeconds": config.echo_fetch_interval,
+                "maxBodyBytes": config.echo_max_body_bytes,
+                "chat": config.echo_chat_enabled,
+            }
         self.routes = {
             "/healthz": {"GET": self.healthz},
             "/v1/info": {"GET": self.get_info},
@@ -202,6 +236,16 @@ class Relay:
         }
         if config.presence_enabled:
             self.routes["/v1/presence"] = {"PUT": self.put_presence, "DELETE": self.delete_presence}
+        if config.echoes_enabled:
+            self.routes["/v1/echoes/clip"] = {"PUT": self.put_clip}
+            self.routes["/v1/echoes/next"] = {"POST": self.next_echo}
+            self.routes["/v1/echoes"] = {"DELETE": self.delete_echoes}
+
+    def body_limit(self, path: str) -> int:
+        """Largest accepted body for ``path``; only clip uploads exceed the default."""
+        if path == "/v1/echoes/clip" and self.config.echoes_enabled:
+            return max(self.config.max_body_bytes, self.config.echo_max_body_bytes)
+        return self.config.max_body_bytes
 
     def admit(self, client: bytes, headers: dict[str, str]) -> None:
         """Request budget, checked from the headers before the body is read.
@@ -289,7 +333,7 @@ class Relay:
         obj = parse_json_object(req)
         _only_keys(obj, {"protocol"}, {"capabilities"})
         _protocol(obj)
-        presence = False
+        caps: list = []
         if "capabilities" in obj:
             caps = obj["capabilities"]
             if (
@@ -299,10 +343,18 @@ class Relay:
                 or len(set(caps)) != len(caps)
             ):
                 raise HttpError(400, "invalid_capabilities")
+            enabled = {
+                "presence": self.config.presence_enabled,
+                "echoes": self.config.echoes_enabled,
+                "chat": self.config.echo_chat_enabled,
+            }
             for cap in caps:
-                if cap not in KNOWN_CAPABILITIES or not self.config.presence_enabled:
+                if not enabled.get(cap, False):
                     raise HttpError(400, "capability_unavailable")
-            presence = "presence" in caps
+            # Chat lines only travel inside echo clips.
+            if "chat" in caps and "echoes" not in caps:
+                raise HttpError(400, "invalid_capabilities")
+        presence, echoes, chat = ("presence" in caps), ("echoes" in caps), ("chat" in caps)
         # Every refusal below gives the creation tokens back: no session was
         # opened, and a relay-wide shortage must not burn a client's budget.
         taken = []
@@ -316,7 +368,7 @@ class Relay:
             self._check_network_room(req.client)
             _spend(self.global_creates)
             try:
-                token, _ = self.store.create_session(presence=presence, net=req.client)
+                token, _ = self.store.create_session(presence=presence, net=req.client, echoes=echoes, chat=chat)
             except CapacityError:
                 raise HttpError(503, "capacity", {"Retry-After": str(self.config.retention_seconds)}) from None
         except HttpError:
@@ -324,8 +376,9 @@ class Relay:
                 buckets.refund(key)
             raise
         body = {"protocol": PROTOCOL, "token": token, **self._session_ttl()}
-        if presence:
-            body["capabilities"] = ["presence"]
+        granted = [c for c in KNOWN_CAPABILITIES if c in caps]
+        if granted:
+            body["capabilities"] = granted
         return Response(201, body)
 
     def refresh_session(self, req: Request) -> Response:
@@ -385,8 +438,184 @@ class Relay:
         self.store.clear_presence(self._presence_session(req))
         return Response(204)
 
+    def _echo_session(self, req: Request) -> Session:
+        session = self._session(req)
+        if not session.echoes:
+            raise HttpError(403, "capability_not_granted")
+        return session
+
+    def _place(self, obj: dict) -> tuple:
+        return (
+            _string(obj, "realm", REALM_RE, 3, 97),
+            _string(obj, "profile", OPAQUE_RE, 8, 64),
+            _string(obj, "instance", OPAQUE_RE, 16, 64),
+            _number(obj, "x", -MAX_HORIZONTAL, MAX_HORIZONTAL),
+            _number(obj, "y", MIN_Y, MAX_Y),
+            _number(obj, "z", -MAX_HORIZONTAL, MAX_HORIZONTAL),
+        )
+
+    def put_clip(self, req: Request) -> Response:
+        session = self._echo_session(req)
+        obj = parse_json_object(req)
+        _only_keys(obj, {"realm", "profile", "instance", "x", "y", "z", "account", "frames"}, {"actions", "chat"})
+        realm, profile, instance, x, y, z = self._place(obj)
+        account = _string(obj, "account", UUID_RE, 36, 36)
+        frames = _frames(obj["frames"], self.config)
+        actions = _actions(obj.get("actions", []), frames)
+        lines = None
+        chat_hash = None
+        if "chat" in obj:
+            if not session.chat:
+                raise HttpError(403, "capability_not_granted")
+            lines, chat_hash = _chat(obj["chat"], session.last_chat, frames[-1][0])
+        self._check_network(req, session)
+        since = self.clock() - session.last_publish
+        if since < self.config.echo_publish_interval:
+            raise _too_many(self.config.echo_publish_interval - since)
+        _spend(self.global_echoes)
+        # Stored re-serialised from validated values only: no client byte is
+        # ever echoed back to another player.
+        body = json.dumps({"account": account, "frames": frames, "actions": actions}, separators=(",", ":"))
+        chat = json.dumps(lines, separators=(",", ":"), ensure_ascii=True) if lines else None
+        try:
+            self.store.publish_clip(session, realm, profile, instance, x, y, z, body, chat, chat_hash, req.client)
+        except AreaFullError:
+            raise HttpError(503, "area_full", {"Retry-After": str(self.config.echo_ttl)}) from None
+        return Response(200, {
+            "expiresInSeconds": self.config.echo_ttl,
+            "chat": len(lines) if lines else 0,
+        })
+
+    def next_echo(self, req: Request) -> Response:
+        session = self._echo_session(req)
+        obj = parse_json_object(req)
+        _only_keys(obj, {"realm", "profile", "instance", "x", "y", "z"})
+        realm, profile, instance, x, y, z = self._place(obj)
+        self._check_network(req, session)
+        since = self.clock() - session.last_fetch
+        if since < self.config.echo_fetch_interval:
+            raise _too_many(self.config.echo_fetch_interval - since)
+        _spend(self.global_echoes)
+        echo = self.store.next_echo(session, realm, profile, instance, x, y, z, req.client)
+        if echo is None:
+            return Response(200, {"echo": None})
+        clip = json.loads(echo.body)
+        out = {
+            "ref": echo.ref,
+            "ageSeconds": round(echo.age, 1),
+            "x": round(echo.x, 3), "y": round(echo.y, 3), "z": round(echo.z, 3),
+            **clip,
+        }
+        if echo.chat is not None:
+            out["chat"] = json.loads(echo.chat)
+        return Response(200, {"echo": out})
+
+    def delete_echoes(self, req: Request) -> Response:
+        # Withdrawal is always allowed, from any network, like DELETE /v1/session.
+        self.store.withdraw_echoes(self._echo_session(req))
+        return Response(204)
+
     def purge(self) -> None:
         self.store.purge(limit=self.config.purge_batch)
+
+
+# -- echo clip validation ----------------------------------------------------
+
+
+def _int_in(value, lo: int, hi: int, code: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+        raise HttpError(400, code)
+    return value
+
+
+def _frames(raw, config: Config) -> list:
+    if not isinstance(raw, list) or not 2 <= len(raw) <= CLIP_MAX_FRAMES:
+        raise HttpError(400, "invalid_frames")
+    out = []
+    prev = None
+    for item in raw:
+        if not isinstance(item, list) or len(item) != 8:
+            raise HttpError(400, "invalid_frames")
+        t = _int_in(item[0], 0, CLIP_MAX_TICKS, "invalid_frames")
+        dx, dy, dz = (_int_in(v, -CLIP_MAX_OFFSET, CLIP_MAX_OFFSET, "invalid_frames") for v in item[1:4])
+        yaw = _int_in(item[4], 0, 255, "invalid_frames")
+        pitch = _int_in(item[5], -64, 64, "invalid_frames")
+        head = _int_in(item[6], 0, 255, "invalid_frames")
+        flags = _int_in(item[7], 0, FRAME_FLAGS, "invalid_frames")
+        if prev is None:
+            # A clip starts at its origin: the stored position is frame 0.
+            if t != 0 or dx or dy or dz:
+                raise HttpError(400, "invalid_frames")
+        else:
+            dt = t - prev[0]
+            if dt <= 0:
+                raise HttpError(400, "invalid_frames")
+            horizontal = math.hypot(dx - prev[1], dz - prev[3]) / 32.0
+            vertical = abs(dy - prev[2]) / 32.0
+            if horizontal > config.echo_max_speed * dt or vertical > config.echo_max_vertical_speed * dt:
+                raise HttpError(400, "implausible_movement")
+        frame = [t, dx, dy, dz, yaw, pitch, head, flags]
+        out.append(frame)
+        prev = frame
+    return out
+
+
+def _actions(raw, frames: list) -> list:
+    if not isinstance(raw, list) or len(raw) > CLIP_MAX_ACTIONS:
+        raise HttpError(400, "invalid_actions")
+    end = frames[-1][0]
+    out = []
+    for item in raw:
+        if not isinstance(item, list) or len(item) != 6:
+            raise HttpError(400, "invalid_actions")
+        t = _int_in(item[0], 0, end, "invalid_actions")
+        kind = _int_in(item[1], 1, 2, "invalid_actions")
+        bx, by, bz = (_int_in(v, -64, 64, "invalid_actions") for v in item[2:5])
+        block = item[5]
+        if not isinstance(block, str) or not BLOCK_RE.fullmatch(block):
+            raise HttpError(400, "invalid_block")
+        # The block must be within reach of the replayed body near that tick.
+        cx, cy, cz = bx + 0.5, by + 0.5, bz + 0.5
+        if not any(
+            abs(f[0] - t) <= 10
+            and math.dist((f[1] / 32.0, f[2] / 32.0 + 1.5, f[3] / 32.0), (cx, cy, cz)) <= CLIP_ACTION_REACH
+            for f in frames
+        ):
+            raise HttpError(400, "implausible_action")
+        out.append([t, kind, bx, by, bz, block])
+    return out
+
+
+def _chat_char_ok(ch: str) -> bool:
+    # Controls, format characters (bidi overrides, zero-width), separators,
+    # private use and the legacy formatting sign are refused outright.
+    return ch != "\u00a7" and unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp")
+
+
+def _chat(raw, last_hash: bytes, end: int) -> tuple[list, bytes | None]:
+    """Validate chat lines; returns the lines worth storing and the new duplicate key."""
+    if not isinstance(raw, list) or len(raw) > CLIP_MAX_CHAT:
+        raise HttpError(400, "invalid_chat")
+    kept = []
+    key = None
+    for item in raw:
+        if not isinstance(item, list) or len(item) != 2:
+            raise HttpError(400, "invalid_chat")
+        # A line is shown during the replay, so it must fall within the clip.
+        t = _int_in(item[0], 0, end, "invalid_chat")
+        text = item[1]
+        if not isinstance(text, str) or not 1 <= len(text) <= CHAT_MAX_CHARS:
+            raise HttpError(400, "invalid_chat")
+        if not all(_chat_char_ok(c) for c in text) or text != text.strip() or "  " in text:
+            raise HttpError(400, "invalid_chat")
+        text = unicodedata.normalize("NFC", text)
+        digest = hashlib.sha256(text.casefold().encode("utf-8")).digest()[:16]
+        # Spam filter: links, long repeats and duplicates are silently dropped.
+        if CHAT_LINK_RE.search(text) or CHAT_REPEAT_RE.search(text) or digest in (last_hash, key):
+            continue
+        kept.append([t, text])
+        key = digest
+    return kept, key
 
 
 def _retry_after(wait: float) -> dict:
@@ -597,7 +826,7 @@ class HttpServer:
             if not length_text.isdigit() or len(length_text) > 6:
                 raise HttpError(400, "bad_request", close=True)
             length = int(length_text)
-            if length > cfg.max_body_bytes:
+            if length > self.relay.body_limit(path):
                 raise HttpError(413, "body_too_large", close=True)
             if method in ("POST", "PUT") and "content-length" not in headers:
                 raise HttpError(411, "length_required", close=True)
