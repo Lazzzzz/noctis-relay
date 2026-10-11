@@ -47,7 +47,7 @@ class EchoApiTest(unittest.TestCase):
 
     def test_info_and_capability_negotiation(self):
         _, info, _ = self.r.request("GET", "/v1/info")
-        self.assertEqual(info["privacyRevision"], 4)
+        self.assertEqual(info["privacyRevision"], 5)
         self.assertEqual(info["capabilities"], ["sessions", "echoes", "chat"])
         self.assertTrue(info["echoes"]["chat"])
         status, body, _ = self.r.request("POST", "/v1/sessions", {"protocol": 1, "capabilities": ["chat"]})
@@ -257,7 +257,7 @@ class EchoApiTest(unittest.TestCase):
         a = self.session()
         big = clip()
         big["actions"] = []
-        raw = json.dumps(big).encode() + b" " * 7000
+        raw = json.dumps(big).encode() + b" " * 16384
         status, body, _ = self.r.request("PUT", "/v1/echoes/clip", token=a, raw_body=raw,
                                          headers={"Content-Type": "application/json"})
         self.assertEqual(status, 413)

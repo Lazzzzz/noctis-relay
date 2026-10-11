@@ -7,21 +7,42 @@ Opens five sessions from this host: one publishes a clip with a chat line,
 another fetches it (with chat), a third fetches it without the chat
 capability, then the publisher withdraws and a last one sees nothing. Also
 checks that a teleporting clip and a clip from the observer's own game
-instance are never served. Standard library only; exits non-zero on failure.
+instance are never served, and that the optional gear (one worn item) comes
+back intact. The relay must publish the privacy revision of this checkout.
+Standard library only; exits non-zero on failure.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import os
+import struct
 import sys
 import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from noctis_relay import PRIVACY_REVISION  # noqa: E402
+
 REALM = "astralyth:noctis"
 PROFILE = "noctis-t1-smoke0123456789"
 ACCOUNT = "0f1e2d3c-4b5a-4968-8776-655443322110"
+
+
+def nbt_string(text):
+    raw = text.encode()
+    return struct.pack(">H", len(raw)) + raw
+
+
+# One worn item as NbtIo.write(ItemStack): {id: "minecraft:diamond_chestplate", count: 1}.
+CHESTPLATE = base64.b64encode(
+    b"\x0a" + nbt_string("") + b"\x08" + nbt_string("id") + nbt_string("minecraft:diamond_chestplate")
+    + b"\x03" + nbt_string("count") + struct.pack(">i", 1) + b"\x00").decode()
+GEAR = {"items": [CHESTPLATE], "slots": [[0, "chest", 0]], "pose": [[4, 1, 60]]}
 
 
 def decode(raw):
@@ -83,9 +104,10 @@ def main():
         time.sleep(0.3)
 
     status, info = call(base, "GET", "/v1/info")
-    expect(status == 200 and info["privacyRevision"] == 4, "info privacy revision 4")
+    expect(status == 200 and info["privacyRevision"] == PRIVACY_REVISION, f"info privacy revision {PRIVACY_REVISION}")
     expect("echoes" in info["capabilities"] and "chat" in info["capabilities"], "echoes and chat offered")
     expect(info["echoes"]["maxBodyBytes"] >= 1024, "echo settings published")
+    expect(info["echoes"].get("gear", {}).get("version") == 1, "gear version 1 announced")
 
     publisher = session(base, ["echoes", "chat"])
     teleport = {
@@ -100,7 +122,10 @@ def main():
         "frames": [[2 * i, 6 * i, 0, 0, 64, 0, 64, 1] for i in range(30)],
         "actions": [[10, 1, 2, 0, 0, "minecraft:stone"]],
         "chat": [[20, "hello from another world"]],
+        "gear": GEAR,
     }
+    status, body = call(base, "PUT", "/v1/echoes/clip", {**clip, "gear": {**GEAR, "pose": [[0, 0, 0]]}}, publisher)
+    expect(status == 400 and body["error"] == "invalid_gear", "gear without a change refused")
     status, body = call(base, "PUT", "/v1/echoes/clip", clip, publisher)
     expect(status == 200 and body["chat"] == 1, "clip published with one chat line")
 
@@ -114,7 +139,8 @@ def main():
     expect(status == 200 and echo and echo["account"] == ACCOUNT, "nearby echo served")
     expect(len(echo["frames"]) == 30 and echo["actions"][0][5] == "minecraft:stone", "frames and actions intact")
     expect(echo.get("chat") == [[20, "hello from another world"]], "chat served to a chat session")
-    expect(set(echo) <= {"ref", "ageSeconds", "x", "y", "z", "account", "frames", "actions", "chat"},
+    expect(echo.get("gear") == GEAR, "gear intact")
+    expect(set(echo) <= {"ref", "ageSeconds", "x", "y", "z", "account", "frames", "actions", "chat", "gear"},
            "no extra fields")
 
     quiet = session(base, ["echoes"])

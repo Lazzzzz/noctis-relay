@@ -2,7 +2,8 @@
 """Publish removable, fictional Noctis action clips through the normal relay API (MIT).
 
 No real Minecraft account, chat, terrain seed or relay administration token is used.
-Retain the private --owner-file to remove these examples later with --remove.
+Retain the private --owner-file to remove these examples later with --remove, or to
+replace them under the current notice with --renew.
 """
 from __future__ import annotations
 
@@ -28,6 +29,8 @@ SCENES = ("regard", "marche", "court", "saute", "creuse", "construit", "torches"
 REALM = "astralyth:noctis"
 DEFAULT_RELAY = "https://noctis.51-91-242-55.sslip.io"
 DEFAULT_PROFILE = "noctis-t1-3fa32a7adc115836"
+# Notice revision acknowledged for these fictional owners: zone retention.
+PRIVACY_REVISION = 5
 
 
 def account(scene: str) -> str:
@@ -147,7 +150,8 @@ def clip(scene: str, x: float, y: float, z: float, profile: str, instance: str) 
 
 def publish(client: Client, master: bytes, scene: str, body: dict) -> bool:
     session = client.request("POST", "/v1/sessions", {
-        "protocol": 1, "capabilities": ["echoes"], "owner": owner(master, scene), "account": account(scene)
+        "protocol": 1, "capabilities": ["echoes"], "owner": owner(master, scene), "account": account(scene),
+        "privacyRevision": PRIVACY_REVISION,
     }, expected=201)
     token = session["token"]
     if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
@@ -159,6 +163,23 @@ def publish(client: Client, master: bytes, scene: str, body: dict) -> bool:
         client.request("DELETE", "/v1/session", token=token, expected=204)
 
 
+def forget(client: Client, master: bytes, scene: str) -> int:
+    response = client.request("POST", "/v1/archive/forget", {
+        "protocol": 1, "owner": owner(master, scene), "scope": "all"})
+    return response["removed"]
+
+
+def compatible(info: dict) -> bool:
+    """Revision-5 relay keeping archives without a maximum age below 92 days."""
+    archive = info.get("archive")
+    if info.get("protocol") != 1 or info.get("privacyRevision") != PRIVACY_REVISION:
+        return False
+    if "echoes" not in info.get("capabilities", []) or not isinstance(archive, dict) or "maxAgeDays" not in archive:
+        return False
+    limit = archive.get("maxAgeDays")
+    return limit is None or (isinstance(limit, int) and limit >= 92)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", default=DEFAULT_RELAY)
@@ -168,7 +189,10 @@ def main() -> int:
     parser.add_argument("--z", type=float)
     parser.add_argument("--owner-file", type=Path, required=True)
     parser.add_argument("--scene", choices=SCENES, action="append")
-    parser.add_argument("--remove", action="store_true")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--remove", action="store_true")
+    action.add_argument("--renew", action="store_true",
+                        help="remove each scene's earlier clips, then publish it again under the current notice")
     args = parser.parse_args()
     try:
         client = Client(args.endpoint)
@@ -176,9 +200,7 @@ def main() -> int:
         scenes = args.scene or SCENES
         if args.remove:
             for scene in scenes:
-                response = client.request("POST", "/v1/archive/forget", {
-                    "protocol": 1, "owner": owner(key, scene), "scope": "all"})
-                print(f"Removed {scene}: {response['removed']} archived clips", flush=True)
+                print(f"Removed {scene}: {forget(client, key, scene)} archived clips", flush=True)
             return 0
         if any(v is None or not math.isfinite(v) for v in (args.x, args.y, args.z)):
             raise ValueError("provide finite --x --y --z at the desired Noctis surface")
@@ -186,14 +208,13 @@ def main() -> int:
             raise ValueError("coordinates out of bounds")
         if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", args.profile):
             raise ValueError("invalid terrain profile")
-        info = client.request("GET", "/v1/info")
-        if info.get("protocol") != 1 or info.get("privacyRevision") != 4 or "echoes" not in info.get("capabilities", []):
-            raise ValueError("incompatible relay")
-        if info.get("archive", {}).get("days", 0) < 92:
-            raise ValueError("relay must retain archives for at least 92 days")
+        if not compatible(client.request("GET", "/v1/info")):
+            raise ValueError("incompatible relay: revision 5 archive without a maximum age under 92 days required")
         instance = "preview_" + secrets.token_hex(16)
         stored = 0
         for scene in scenes:
+            if args.renew:
+                print(f"{scene}: removed {forget(client, key, scene)} earlier clips", flush=True)
             admitted = publish(client, key, scene, clip(scene, args.x, args.y, args.z, args.profile, instance))
             stored += admitted
             print(f"{scene}: {'archived' if admitted else 'not archived (sampling or capacity)'}", flush=True)

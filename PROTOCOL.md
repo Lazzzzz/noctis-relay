@@ -3,8 +3,8 @@
 All bodies are UTF-8 JSON objects with `Content-Type: application/json` and a
 `Content-Length` (no chunked encoding). Unknown fields, duplicate keys, `NaN`,
 `Infinity`, booleans where numbers are expected and bodies above
-`NOCTIS_MAX_BODY_BYTES` (1024 by default; `NOCTIS_ECHO_MAX_BODY_BYTES`, 6144 by
-default, for `PUT /v1/echoes/clip`) are rejected. Errors are
+`NOCTIS_MAX_BODY_BYTES` (1024 by default; `NOCTIS_ECHO_MAX_BODY_BYTES`, 16384
+by default, for `PUT /v1/echoes/clip`) are rejected. Errors are
 `{"error": "<code>"}`. Responses carry `Cache-Control: no-store` and no CORS
 headers: the API is meant for the game client, not for browsers.
 
@@ -32,12 +32,12 @@ they answer `404`.
 ```json
 {
   "protocol": 1,
-  "privacyRevision": 4,
+  "privacyRevision": 5,
   "retentionSeconds": 30,
   "heartbeatSeconds": 10,
   "operator": {"name": "Example relay", "contact": "relay-admin@example.org"},
   "capabilities": ["sessions"],
-  "server": {"name": "noctis-relay", "version": "0.4.0"}
+  "server": {"name": "noctis-relay", "version": "0.5.0"}
 }
 ```
 
@@ -53,9 +53,15 @@ features are unchanged. With echoes enabled, `capabilities` also lists
 `"echoes"` (and `"chat"` when enabled) and an `echoes` object gives
 `ttlSeconds`, `radius`, `vertical`, `publishIntervalSeconds`,
 `fetchIntervalSeconds`, `maxBodyBytes` and `chat`. Revision 4 (relay 0.4.0)
-adds the optional durable archive: when it is enabled an `archive` object gives
-`days`, `intervalSeconds`, `ownerDaily` and `cellDaily` (see
-[Archive](#archive)).
+adds the optional durable archive. Revision 5 (relay 0.5.0) replaces its single
+lifetime by a quota per zone: clips of sparse zones are kept without time
+limit, a full zone replaces its own oldest clips once they are at least
+`ageFloorDays` old. The `archive` object now gives `ageFloorDays`,
+`maxAgeDays`, `zoneQuota`, `zone`, `legacyDays`, `intervalSeconds`,
+`ownerDaily` and `cellDaily`; the former `days` is gone (see
+[Archive](#archive)). Sessions may acknowledge the accepted notice revision
+(`privacyRevision`), and clips may carry the visible equipment of the player
+(`gear`, announced by an `echoes.gear` object, see [Gear](#gear)).
 
 ### Sessions
 
@@ -98,7 +104,7 @@ waiting `Retry-After` seconds; nothing else is required from them.
 
 | Status | `error` | Meaning |
 |---|---|---|
-| `400` | `invalid_json`, `invalid_fields`, `invalid_protocol`, `unsupported_protocol`, `invalid_<field>`, `bad_request`, … | Malformed body or request |
+| `400` | `invalid_json`, `invalid_fields`, `invalid_protocol`, `unsupported_protocol`, `invalid_<field>` (e.g. `invalid_privacy_revision`, `invalid_gear`), `bad_request`, … | Malformed body or request |
 | `401` | `invalid_token`, `session_expired` | Create a new session |
 | `403` | `forbidden` | Network blocked by the operator (connection closed) |
 | `403` | `capability_not_granted` | Presence or echo route (or chat lines) without the capability |
@@ -259,6 +265,8 @@ session without `chat` gets the same error.
   no controls, format/bidi characters, private use, line separators, `§`,
   leading/trailing or double spaces (`400 invalid_chat`). Lines with links,
   long repeats or duplicating the previous line are silently dropped.
+- `gear` (optional, only when `/v1/info` announces `echoes.gear`): the visible
+  equipment of the body, see [Gear](#gear) (`400 invalid_gear`).
 
 Unknown keys, wrong types or out-of-range values are refused as a whole. The
 relay stores the clip re-serialised from validated values, replacing the
@@ -279,14 +287,57 @@ session:
 {"echo": {"ref": "9c1f0a3be2d47781", "ageSeconds": 4.2,
           "x": 120.5, "y": 64.0, "z": -48.25,
           "account": "0f1e2d3c-4b5a-4968-8776-655443322110",
-          "frames": [...], "actions": [...], "chat": [[2, "hello"]]}}
+          "frames": [...], "actions": [...], "chat": [[2, "hello"]],
+          "gear": {...}}}
 ```
 
-`chat` is only present when both sessions hold the `chat` capability. `ref`
+`chat` is only present when both sessions hold the `chat` capability, `gear`
+only when the clip carried one. `ref`
 is opaque and differs per observer. Each clip is delivered at most once per
 observer; the delivery record expires with the clip. Lookups closer than
 `fetchIntervalSeconds` get `429`. Uploads and lookups both draw from a
 relay-wide echo budget (`503 overloaded`).
+
+### Gear
+
+When `/v1/info` announces an `echoes.gear` object (`version` 1 and the limits
+below; `NOCTIS_ECHO_GEAR=0` removes it and the key is then refused as
+`invalid_fields`), a clip may carry the visible equipment of the body:
+
+```json
+"gear": {"items": ["CgAACAACaWQAHG1pbmVjcmFmdDpkaWFtb25kX2NoZXN0cGxhdGUDAAVjb3VudAAAAAEA"],
+         "slots": [[0, "chest", 0], [40, "chest", -1]],
+         "pose": [[4, 1, 60]]}
+```
+
+- `items`: ≤ 12 distinct strings, each the padded standard base64 of one item
+  stack in binary NBT as written by Minecraft (`NbtIo.write` of the item
+  codec: a root compound with `id`, `count` 1–99 and optional `components`),
+  ≤ 2048 bytes each and 6144 in total, depth ≤ 12, ≤ 512 tags, lists ≤ 256,
+  strings ≤ 1024 bytes, no compression. Components holding stored contents,
+  writings, places or captured entities and blocks are refused, set or
+  removed: `minecraft:` `container`, `bundle_contents`,
+  `writable_book_content`, `written_book_content`, `lodestone_tracker`,
+  `map_id`, `map_decorations`, `entity_data`, `bucket_entity_data`,
+  `block_entity_data`, `bees`, `container_loot`, `recipes`,
+  `debug_stick_state`. Names, lore, custom data and modded components are kept,
+  as models and resource packs select on them.
+- `slots`: ≤ 48 changes `[t, slot, item]`, `t` non-decreasing up to the tick of
+  the last frame; every slot starts empty; `item` indexes `items` or is −1
+  (empty), each change differs from the slot's current item, every item is
+  used. `slot` is `head`, `chest`, `legs`, `feet`, `mainhand`, `offhand` or a
+  `namespace:path` (≤ 16 distinct).
+- `pose`: ≤ 64 changes `[t, bits, power]` from the neutral `[0, 0]`, `t`
+  strictly increasing up to the last frame; `bits` 1 fall flying, 2 using an
+  item, 4 using the off hand (with 2), 8 off-hand swing, 16 left-handed,
+  32 spin attack; `power` 0–100 (jetpack thrust percent).
+- At least one of `slots` and `pose` is non-empty; the compact JSON of `gear`
+  is at most 10240 bytes, so the largest clip with gear stays below 16 KiB.
+
+The relay checks this structure, stores the canonical form with the clip (same
+lifetime, archive and deletion) and never interprets the items. Receivers must
+decode it with the same limits as cosmetic data only — never as a player save
+or an inventory — and skip unknown items or components.
 
 ### Withdrawal
 
@@ -305,49 +356,81 @@ names and skins only from the official account service.
 ## Archive
 
 Optional, operator-enabled (`NOCTIS_ARCHIVE_PATH`, needs echoes). The relay
-then keeps a **sample** of echo clips on disk for `days` (92 by default) and
-serves them to nearby observers when no live clip is available, also after
-their author left. The `archive` object in `/v1/info` announces it:
+then keeps a **sample** of echo clips on disk under a quota per zone and serves
+them to nearby observers when no live clip is available, also after their
+author left. The `archive` object in `/v1/info` announces it:
 
 ```json
-"archive": {"days": 92, "intervalSeconds": 300, "ownerDaily": 48, "cellDaily": 24}
+"archive": {"ageFloorDays": 92, "maxAgeDays": null, "zoneQuota": 4096,
+            "zone": {"width": 32, "height": 16}, "legacyDays": 92,
+            "intervalSeconds": 300, "ownerDaily": 48, "cellDaily": 24}
 ```
+
+### Retention
+
+- A *zone* is one cell of the spatial index: `zone.width` × `zone.height` ×
+  `zone.width` blocks of one realm and terrain profile. It holds at most
+  `zoneQuota` clips.
+- A clip archived in a **full** zone replaces the oldest clips of that same
+  zone that are at least `ageFloorDays` old. If the zone holds none, the new
+  clip is not archived (it is still served live). A zone below its quota keeps
+  all its clips: a quiet place keeps its rare visits without time limit, and
+  nothing is ever removed from one zone to make room in another.
+- The relay-wide row and byte caps never delete anything: once they are
+  reached, a clip is archived only when it replaces old enough clips of its
+  own full zone, otherwise it is refused.
+- `maxAgeDays` is `null` (no time limit) or the age after which the operator
+  deletes every clip; it is never below `ageFloorDays`.
+- Clips of sessions that did not acknowledge revision 5 (below), and clips
+  migrated from an archive of relay 0.4.0, keep the fixed lifetime they were
+  collected under: they are deleted `legacyDays` days after their creation,
+  whatever their zone.
+
+A client describes retention from these fields: at least `ageFloorDays` days
+in a busy zone, until `maxAgeDays` or without time limit in a quiet one. The
+former single `days` field is gone; a client that only knows it must not
+present a revision 5 relay as a fixed-lifetime relay.
 
 ### Owner key at session creation
 
 ```json
 {"protocol": 1, "capabilities": ["echoes"],
- "owner": "<64 lowercase hex>", "account": "0f1e2d3c-4b5a-4968-8776-655443322110"}
+ "owner": "<64 lowercase hex>", "account": "0f1e2d3c-4b5a-4968-8776-655443322110",
+ "privacyRevision": 5}
 ```
 
-Both fields are optional. `owner` is a random 32-byte secret chosen by the
+All three fields are optional. `owner` is a random 32-byte secret chosen by the
 client, one per relay address and account, kept private and sent only to the
 relay it belongs to. The relay stores only `sha256(owner)[:16]`. `account` binds
 the session: a clip whose `account` differs is never archived. Without `owner`
-nothing of the session is archived.
+nothing of the session is archived. `privacyRevision` is the notice revision
+the player accepted, an integer from 1 to the relay's `privacyRevision`
+(otherwise `400 invalid_privacy_revision`): with 5 the session's clips follow
+the zone quota; absent or below 5 they keep the fixed `legacyDays` lifetime.
+The relay records the declaration, it does not verify consent.
 
 ### Sampling
 
 `PUT /v1/echoes/clip` answers `"archived": true|false`. `false` is ordinary
 sampling, not an error, and promises nothing. A clip is archived only when it
 moves at least one block or holds an action, at most once per
-`intervalSeconds` and `ownerDaily` times a day per owner, `cellDaily` times a
-day per 16-block cell, below `NOCTIS_ARCHIVE_CELL_MAX` clips per cell and below
-the operator's row and byte caps (a full archive refuses; it never evicts
-older clips). A relay-wide write budget also applies.
+`intervalSeconds`, `ownerDaily` times per UTC day per owner and `cellDaily`
+times per UTC day per zone, within the zone quota and relay caps above. A
+relay-wide write budget also applies.
 
 ### Serving
 
 `POST /v1/echoes/next` returns a live clip first, otherwise an archived one in
-the same area, with the same body format. `ageSeconds` may then reach
-`days × 86400`; a client accepts such ages only from a relay that announces an
-archive. Archived clips never come from the observer's own owner, account or
-game instance (the instance fingerprint is `sha256(instance)[:16]`, stable
-across relay restarts), are older than the live lifetime, and are served at
-most once per observer session (records kept 6 hours). Selection reads at most
-`per_cell` (8) index entries per cell from a random pivot, so busy places and
-old visits both appear. Chat is served only to chat sessions and is filtered
-again when served.
+the same area, with the same body format. `ageSeconds` may then exceed
+`ageFloorDays × 86400`, without bound when `maxAgeDays` is `null`; a client
+accepts such ages only from a relay that announces an archive. Archived clips
+never come from the observer's own owner, account or game instance (the
+instance fingerprint is `sha256(instance)[:16]`, stable across relay
+restarts), are older than the live lifetime, and are served at most once per
+observer session (records kept 6 hours). Selection reads at most `per_cell`
+(8) index entries per cell from a random pivot, so busy places and old visits
+both appear. Chat is served only to chat sessions and is filtered again when
+served.
 
 ### `POST /v1/archive/forget`
 
@@ -367,8 +450,11 @@ enabled; there is no listing or administrative route.
 
 ### Failure
 
-The archive file is created with mode 0600 and WAL journal. A file with an
-unknown schema or that SQLite cannot open stops the relay at start (exit code
-2); it is never reset or rewritten. A runtime database error disables the
+The archive file is created with mode 0600 and WAL journal. An archive of
+relay 0.4.0 (schema 1) is migrated at start in one transaction to schema 2, its
+clips keeping their fixed lifetime; relay 0.4.0 refuses the migrated file, so a
+downgrade needs the copy taken before the upgrade. A file with an unknown
+schema or that SQLite cannot open stops the relay at start (exit code 2); it is
+never reset or rewritten. A runtime database error disables the
 archive (no archiving, no archived serving, forget answers 503) until restart;
 live echoes continue.

@@ -40,7 +40,9 @@ CREATE TABLE session (
     -- Hash of the owner secret (archive and private deletion), and the
     -- account the client declared (only used to exclude its own replays).
     owner BLOB,
-    account TEXT NOT NULL DEFAULT ''
+    account TEXT NOT NULL DEFAULT '',
+    -- Privacy notice revision the client acknowledged (0: none).
+    revision INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX session_expires ON session(expires);
 CREATE INDEX session_owner ON session(owner) WHERE owner IS NOT NULL;
@@ -129,6 +131,7 @@ class Session:
     last_chat: bytes = b""
     owner: bytes | None = None
     account: str = ""
+    revision: int = 0
 
 
 @dataclass(frozen=True)
@@ -215,7 +218,7 @@ class Store:
 
     def create_session(
         self, presence: bool = False, net: bytes = b"", echoes: bool = False, chat: bool = False,
-        owner: bytes | None = None, account: str = "",
+        owner: bytes | None = None, account: str = "", revision: int = 0,
     ) -> tuple[str, Session]:
         now = self.clock()
         if self._session_rows >= self.max_sessions:
@@ -227,24 +230,25 @@ class Store:
         token = secrets.token_hex(32)
         expires = now + self.retention
         cur = self.db.execute(
-            "INSERT INTO session(token_hash, expires, presence, net, echoes, chat, owner, account) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (hash_token(token), expires, 1 if presence else 0, net, int(echoes), int(chat), owner, account),
+            "INSERT INTO session(token_hash, expires, presence, net, echoes, chat, owner, account, revision) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (hash_token(token), expires, 1 if presence else 0, net, int(echoes), int(chat), owner, account,
+             revision),
         )
         self._session_rows += 1
         return token, Session(cur.lastrowid, expires, presence, -1e300, net, echoes, chat,
-                              owner=owner, account=account)
+                              owner=owner, account=account, revision=revision)
 
     def find_session(self, token: str) -> Session | None:
         row = self.db.execute(
             "SELECT sid, expires, presence, last_presence, net, echoes, chat, last_publish, last_fetch, "
-            "last_chat, owner, account FROM session WHERE token_hash = ?",
+            "last_chat, owner, account, revision FROM session WHERE token_hash = ?",
             (hash_token(token),),
         ).fetchone()
         if row is None or row[1] <= self.clock():
             return None
         return Session(row[0], row[1], bool(row[2]), row[3], row[4], bool(row[5]), bool(row[6]),
-                       row[7], row[8], row[9], row[10], row[11])
+                       row[7], row[8], row[9], row[10], row[11], row[12])
 
     def refresh_session(self, session: Session, net: bytes | None = None) -> Session | None:
         """Extend a live session and attribute it to ``net`` (if given)."""

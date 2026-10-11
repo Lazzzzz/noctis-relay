@@ -30,9 +30,10 @@ does not print it, session tokens or request bodies. It never uploads chat.
 Network, session, spatial and archive limits still apply. The tool honours
 `Retry-After` with bounded retries; seeding can take several minutes. It reports
 each successful archival admission, revokes every temporary source session,
-and exits with status 2 if sampling or capacity refused any archive. Existing
-unexpired visits are never evicted to make room. Add `--scene construit` to
-publish one scene.
+and exits with status 2 if sampling or capacity refused any archive. Seeding
+never removes other visits: a zone below its quota keeps all its clips, and a
+full zone only replaces its own clips older than the announced age floor. Add
+`--scene construit` to publish one scene.
 
 Remove these visitors from the same relay with the same private owner file:
 
@@ -42,9 +43,27 @@ python3 -B tools/seed_previews.py \
   --owner-file /private/location/noctis-demo-owner.key --remove
 ```
 
+Clips seeded on relay 0.4.0 keep, after the archive migration of relay 0.5.0,
+the fixed 92-day lifetime of their former notice. Replace them under the
+current notice with the same owner file, profile and coordinates:
+
+```sh
+python3 -B tools/seed_previews.py \
+  --endpoint https://your-relay.example \
+  --profile noctis-t1-3fa32a7adc115836 \
+  --x 0.5 --y 100 --z 0.5 \
+  --owner-file /private/location/noctis-demo-owner.key --renew
+```
+
+For each scene, `--renew` deletes its earlier clips and then publishes it
+again; it exits with status 2 if a scene was deleted but not archived again,
+which a later run repairs.
+
 Remote endpoints must use HTTPS; loopback HTTP is available for local tests.
-Redirects are refused. The tool requires a compatible relay retaining archives
-for at least 92 days. It adds no privileged endpoint or administration bypass.
+Redirects are refused. The tool requires a relay of privacy revision 5 whose
+archive announces no maximum age below 92 days (`maxAgeDays` null or at least
+92). Its fictional owners acknowledge revision 5, so their clips follow the
+zone quota. It adds no privileged endpoint or administration bypass.
 
 In the mod, `/astro noctis preview publier` explicitly publishes a fictional
 scene near the current observer on their approved relay and terrain profile.

@@ -1,4 +1,7 @@
-"""Durable archive: persistence, private deletion, sampling, caps, purge, plans, filter."""
+"""Durable archive: persistence, private deletion, sampling, caps, purge, plans, filter.
+
+Zone retention and the schema-1 migration are in test_zone_retention.py.
+"""
 
 import os
 import random
@@ -54,8 +57,9 @@ class ArchiveRelayTest(unittest.TestCase):
         self.stop()
         self.dir.cleanup()
 
-    def owner_session(self, owner=OWNER_A, account=ACCOUNT, chat=True):
-        return self.r.create(capabilities=["echoes", "chat"] if chat else ["echoes"], owner=owner, account=account)
+    def owner_session(self, owner=OWNER_A, account=ACCOUNT, chat=True, **extra):
+        return self.r.create(capabilities=["echoes", "chat"] if chat else ["echoes"], owner=owner, account=account,
+                             **extra)
 
     def observer(self, chat=True):
         return self.r.create(capabilities=["echoes", "chat"] if chat else ["echoes"],
@@ -77,7 +81,8 @@ class ArchiveRelayTest(unittest.TestCase):
 
     # -- persistence -------------------------------------------------------
 
-    def test_served_after_logout_restart_and_days(self):
+    def test_unacknowledged_owner_keeps_fixed_lifetime(self):
+        # A session that did not acknowledge revision 5 is archived as under revision 4.
         a = self.owner_session()
         status, body, _ = self.publish(a, clip(chat=[[2, "bonsoir"]]))
         self.assertEqual((status, body["archived"]), (200, True))
@@ -86,8 +91,8 @@ class ArchiveRelayTest(unittest.TestCase):
         self.stop()
         self.later(2 * DAY)
         self.start()
-        self.assertEqual(self.r.relay.info["archive"]["days"], 92)
-        self.assertEqual(self.r.request("GET", "/v1/info")[1]["privacyRevision"], 4)
+        self.assertEqual(self.r.relay.info["archive"]["legacyDays"], 92)
+        self.assertEqual(self.r.request("GET", "/v1/info")[1]["privacyRevision"], 5)
         o = self.observer()
         echo = self.fetch(o)[1]["echo"]
         self.assertIsNotNone(echo)
@@ -315,10 +320,10 @@ class ArchiveUnitTest(unittest.TestCase):
     def test_query_plans_use_indexes(self):
         a = self.open()
         plans = " | ".join(a.explain())
-        self.assertIn("clip_cell", plans)
-        self.assertIn("clip_created", plans)
-        self.assertIn("clip_owner", plans)
-        self.assertNotRegex(plans, r"SCAN clip(?! USING)")
+        for index in ("clip_cell", "clip_zone", "clip_created", "clip_expires", "clip_owner",
+                      "cell_empty", "owner_empty"):
+            self.assertIn(index, plans)
+        self.assertNotIn("SCAN", plans)
         self.assertNotIn("TEMP B-TREE", plans)
 
     def test_variety_and_old_visits(self):

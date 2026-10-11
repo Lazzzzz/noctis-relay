@@ -168,3 +168,38 @@ surface and caves. Simulated clock; nothing leaves the machine.
 
 The default purge batch is 200 rows (`NOCTIS_ARCHIVE_PURGE_BATCH`) so that one
 pass stays far below the request deadlines of the single event loop.
+
+## 2026-10-11 — relay 0.5.0 zone retention (`bench_archive.py`), same machine, load ≈ 5–7
+
+`python3 bench/bench_archive.py --check`: production retention defaults (zone
+quota 4096, 24 clips per zone per UTC day, 92-day floor), on-disk archive, WAL,
+`synchronous=FULL` for every measured operation (the fill alone uses NORMAL).
+365 simulated days: a busy 96-block square (9 zones) receives its 24 clips per
+zone every day, fills after about 171 days and then replaces its own oldest
+clips; 40 000 sparse clips are dispersed over 20 000 × 20 000 blocks (surface
+and caves, outside the busy zones) and are never replaced, 10 % of them with
+the fixed 92-day lifetime of legacy clips. 5 000 owners, one heavy owner with
+1 clip in 50. Simulated clock; nothing leaves the machine.
+
+| Measure | Result |
+|---|---|
+| Fill | 76 864 clips in 19.0 s, 57.3 MB on disk (≈ 750 B per clip) |
+| Busy zones | 78 840 / 78 840 offered clips admitted; every zone at 4 096 clips, 171 days of history |
+| Admission with replacement, p50 / p99 | 0.14 / 7.5 ms (p99: WAL checkpoints); sparse admission 0.09 / 0.17 ms |
+| Lookup, busy square, p50 / p99 | 0.29 / 0.45–0.50 ms over three runs; 2 000 / 2 000 served, 1 586 distinct accounts, ages p10 / p50 / p90 16 / 85 / 152 days |
+| Lookup, dispersed, p50 / p99 | 0.06 / 0.17 ms; 583 / 2 000 served, ages p50 165 days |
+| Lookup at the oldest sparse clips, p50 / p99 | 0.08 / 0.20 ms; 300 / 300 served, 292 older than 92 days (p50 364 days) |
+| Index entries read | ≤ 800 per lookup (8 per cell from a random pivot), ≤ 16 per replacement |
+| Query plans | `clip_cell`, `clip_zone`, `clip_expires`, `clip_created`, `clip_owner`, primary keys, `owner_empty`, `cell_empty`; no table scan |
+| Private deletion of the heavy owner | 1 510 clips in 72 ms, then WAL truncated |
+| Purge of fixed lifetimes | 15 batches of ≤ 200 rows in 0.4 s, batch p99 25 ms; zone-retention clips untouched |
+
+With `--sparse 120000` (156 864 clips, 124 MB, load ≈ 5, check passed):
+busy-square lookup p50 / p99 0.37 / 0.55 ms, dispersed 0.14 / 0.29 ms, oldest
+sparse 0.13 / 0.32 ms with 283 / 300 served clips older than 92 days; deletion
+of the heavy owner 3 127 clips in 170 ms; 45 purge batches, p99 30 ms. Admission
+latency includes `fsync`, cheap on this SSD; expect more on a VPS disk. A
+sparse clip placed in a busy zone takes a slot of that zone's `cellDaily`
+budget like any other owner: the anti-abuse quota then refuses the zone's last
+clip of the day, which is expected and not a retention failure, so the
+benchmark keeps sparse clips outside the busy zones.

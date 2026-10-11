@@ -1,6 +1,7 @@
 """Fictional seeds use the public API and survive source logout, then are removable."""
 import importlib.util
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 
@@ -44,6 +45,19 @@ class SeedPreviewsTest(unittest.TestCase):
                     seen.add(response["echo"]["account"])
                     self.assertNotIn("chat", response["echo"])
                 self.assertEqual(seen, {seed.account(scene) for scene in seed.SCENES})
+                # Revision 5 acknowledged: zone retention, no fixed expiry.
+                with sqlite3.connect(archive.path) as db:
+                    self.assertEqual(db.execute("SELECT count(*) FROM clip WHERE expires IS NULL").fetchone()[0], 8)
+                    db.execute("UPDATE clip SET expires = created + 7948800")  # as migrated from schema 1
+                db.close()
+                # --renew: each scene's earlier clip is replaced by one without a fixed expiry.
+                self.assertEqual(seed.forget(client, key, "court"), 1)
+                self.assertTrue(seed.publish(client, key, "court",
+                    seed.clip("court", .5, 81, .5, seed.DEFAULT_PROFILE, "preview_fictional_renewed")))
+                with sqlite3.connect(archive.path) as db:
+                    self.assertEqual(db.execute("SELECT count(*) FROM clip WHERE expires IS NULL").fetchone()[0], 1)
+                db.close()
+                self.assertEqual(archive.rows, 8)
                 for scene in seed.SCENES:
                     status, response, _ = relay.request("POST", "/v1/archive/forget", {
                         "protocol": 1, "owner": seed.owner(key, scene), "scope": "all"})
@@ -64,6 +78,15 @@ class SeedPreviewsTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 seed.endpoint(address)
         self.assertEqual(seed.endpoint("http://127.0.0.1:8787/"), "http://127.0.0.1:8787")
+
+    def test_relay_compatibility(self):
+        info = {"protocol": 1, "privacyRevision": 5, "capabilities": ["sessions", "echoes"],
+                "archive": {"ageFloorDays": 92, "maxAgeDays": None}}
+        self.assertTrue(seed.compatible(info))
+        self.assertTrue(seed.compatible({**info, "archive": {"maxAgeDays": 92}}))
+        for bad in ({"privacyRevision": 4}, {"archive": {"maxAgeDays": 91}}, {"archive": {"days": 92}},
+                    {"archive": None}, {"capabilities": ["sessions"]}, {"archive": {"maxAgeDays": "x"}}):
+            self.assertFalse(seed.compatible({**info, **bad}), bad)
 
 
 if __name__ == "__main__":

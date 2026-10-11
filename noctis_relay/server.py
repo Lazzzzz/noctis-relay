@@ -22,8 +22,8 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Callable
 
-from . import PRIVACY_REVISION, PROTOCOL, __version__
-from .archive import Archive, ArchiveError, owner_hash
+from . import PRIVACY_REVISION, PROTOCOL, __version__, equipment
+from .archive import QUOTA_REVISION, Archive, ArchiveError, owner_hash
 from .config import Config, ConfigError, load_config, load_deny_file
 from .profanity import Filter
 from .ratelimit import Bucket, Concurrency, Fingerprints, NetworkSet, TokenBuckets, client_key, prefix_key
@@ -189,7 +189,9 @@ def open_archive(config: Config, wallclock: Callable[[], float] = time.time) -> 
         return None
     return Archive(
         config.archive_path,
-        days=config.archive_days,
+        floor_days=config.archive_floor_days,
+        max_days=config.archive_max_days,
+        legacy_days=config.archive_days,
         cell_size=config.cell_size,
         cell_height=config.cell_height,
         radius=config.echo_radius,
@@ -276,9 +278,16 @@ class Relay:
                 "maxBodyBytes": config.echo_max_body_bytes,
                 "chat": config.echo_chat_enabled,
             }
+            if config.echo_gear_enabled:
+                self.info["echoes"]["gear"] = equipment.INFO
         if archive is not None:
+            # No single "days": a floor is not a lifetime (see PROTOCOL.md, Archive).
             self.info["archive"] = {
-                "days": config.archive_days,
+                "ageFloorDays": config.archive_floor_days,
+                "maxAgeDays": config.archive_max_days or None,
+                "zoneQuota": config.archive_cell_max,
+                "zone": {"width": config.cell_size, "height": config.cell_height},
+                "legacyDays": config.archive_days,
                 "intervalSeconds": config.archive_interval,
                 "ownerDaily": config.archive_owner_daily,
                 "cellDaily": config.archive_cell_daily,
@@ -387,9 +396,16 @@ class Relay:
 
     def create_session(self, req: Request) -> Response:
         obj = parse_json_object(req)
-        _only_keys(obj, {"protocol"}, {"capabilities", "owner", "account"})
+        _only_keys(obj, {"protocol"}, {"capabilities", "owner", "account", "privacyRevision"})
         _protocol(obj)
         owner = owner_hash(_string(obj, "owner", TOKEN_RE, 64, 64)) if "owner" in obj else None
+        # The notice revision the player accepted; below QUOTA_REVISION (or
+        # absent) archived clips keep the fixed lifetime of revision 4.
+        revision = 0
+        if "privacyRevision" in obj:
+            revision = obj["privacyRevision"]
+            if isinstance(revision, bool) or not isinstance(revision, int) or not 1 <= revision <= PRIVACY_REVISION:
+                raise HttpError(400, "invalid_privacy_revision")
         account = _string(obj, "account", UUID_RE, 36, 36) if "account" in obj else ""
         caps: list = []
         if "capabilities" in obj:
@@ -427,7 +443,8 @@ class Relay:
             _spend(self.global_creates)
             try:
                 token, _ = self.store.create_session(
-                    presence=presence, net=req.client, echoes=echoes, chat=chat, owner=owner, account=account)
+                    presence=presence, net=req.client, echoes=echoes, chat=chat, owner=owner, account=account,
+                    revision=revision)
             except CapacityError:
                 raise HttpError(503, "capacity", {"Retry-After": str(self.config.retention_seconds)}) from None
         except HttpError:
@@ -516,11 +533,18 @@ class Relay:
     def put_clip(self, req: Request) -> Response:
         session = self._echo_session(req)
         obj = parse_json_object(req)
-        _only_keys(obj, {"realm", "profile", "instance", "x", "y", "z", "account", "frames"}, {"actions", "chat"})
+        optional = {"actions", "chat", "gear"} if self.config.echo_gear_enabled else {"actions", "chat"}
+        _only_keys(obj, {"realm", "profile", "instance", "x", "y", "z", "account", "frames"}, optional)
         realm, profile, instance, x, y, z = self._place(obj)
         account = _string(obj, "account", UUID_RE, 36, 36)
         frames = _frames(obj["frames"], self.config)
         actions = _actions(obj.get("actions", []), frames, (x, y, z))
+        gear = None
+        if "gear" in obj:
+            try:
+                gear = equipment.parse_gear(obj["gear"], frames[-1][0])
+            except equipment.GearError:
+                raise HttpError(400, "invalid_gear") from None
         lines = None
         chat_hash = None
         if "chat" in obj:
@@ -533,8 +557,11 @@ class Relay:
             raise _too_many(self.config.echo_publish_interval - since)
         _spend(self.global_echoes)
         # Stored re-serialised from validated values only: no client byte is
-        # ever echoed back to another player.
-        body = json.dumps({"account": account, "frames": frames, "actions": actions}, separators=(",", ":"))
+        # ever echoed back to another player outside the checked gear items.
+        clip = {"account": account, "frames": frames, "actions": actions}
+        if gear is not None:
+            clip["gear"] = gear
+        body = json.dumps(clip, separators=(",", ":"))
         chat = json.dumps(lines, separators=(",", ":"), ensure_ascii=True) if lines else None
         try:
             self.store.publish_clip(session, realm, profile, instance, x, y, z, body, chat, chat_hash, req.client)
@@ -561,7 +588,7 @@ class Relay:
         if budget is not None and budget.take() > 0:
             return False
         cid = archive.admit(session.owner, account, realm, profile, Store.instance_key(instance),
-                            x, y, z, body, chat)
+                            x, y, z, body, chat, fixed=session.revision < QUOTA_REVISION)
         if cid is None:
             return False
         self.store.link_archive(session, cid)
@@ -1036,6 +1063,11 @@ def main() -> int:
         log.error("archive error: %s", exc)
         return 2
     if archive is not None:
-        log.info("archive: %d clips kept for %d days", archive.rows, config.archive_days)
+        log.info("archive: %d clips; zone quota %d, age floor %d days, %s", archive.rows,
+                 config.archive_cell_max, config.archive_floor_days,
+                 f"maximum age {config.archive_max_days} days" if config.archive_max_days else "no time limit")
+        if config.archive_cell_max < config.archive_cell_daily * config.archive_floor_days:
+            log.warning("archive: zone quota below cell daily x floor days; a busy zone may refuse "
+                        "new clips until its oldest reach the floor")
     asyncio.run(serve(config, archive))
     return 0

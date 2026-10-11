@@ -1,4 +1,4 @@
-# Privacy notice — revision 4
+# Privacy notice — revision 5
 
 This describes what the **noctis-relay software** does with data. Each relay is
 run by an independent operator whose name and contact are published at
@@ -9,6 +9,15 @@ software authors, is responsible for running the relay lawfully (for example
 under the GDPR in the EU). Using this software does not by itself make a relay
 compliant with any regulation.
 
+Revision 5 (relay 0.5.0) replaces the archive's single 92-day lifetime with a
+**quota per zone**: in a place few players visit, archived clips are kept
+**without time limit** (unless the operator sets a maximum age); a busy zone
+keeps at most a fixed number of clips and replaces its own oldest ones only
+once they are at least 92 days old. Clips collected under revision 4, or sent
+by a game that did not confirm revision 5, keep their fixed 92-day lifetime.
+Echo clips may also carry the player's **visible equipment** (worn and held
+items with their appearance data, never container or book contents), kept and
+deleted with the clip.
 Revision 4 (relay 0.4.0) adds the optional **durable archive** of echoes (off
 unless the operator sets `NOCTIS_ARCHIVE_PATH`): a sample of clips is kept on
 disk for up to 92 days with a hash of a private owner key, and can be deleted
@@ -70,8 +79,14 @@ compte Minecraft** (sans pseudo, skin ni jeton de connexion), la dimension, un
 profil de terrain opaque (jamais la graine), l'identifiant aléatoire de la
 partie en cours (le relais n'en garde qu'une empreinte SHA-256 tronquée), une
 position d'origine, au plus 6 secondes de mouvements (positions relatives,
-orientation, accroupi/sprint/nage/geste) et au plus 8 poses ou casses de blocs
-(position relative, identifiant de bloc). Le relais le stocke tel que validé,
+orientation, accroupi/sprint/nage/geste), au plus 8 poses ou casses de blocs
+(position relative, identifiant de bloc) et, si le relais l'annonce, votre
+**équipement visible** : objets portés ou tenus (armure, mains, réacteur dorsal,
+emplacements de mods) avec leurs données d'apparence (nom, description,
+composants de mods), leurs changements et quelques postures (vol plané,
+utilisation d'un objet, poussée du réacteur). Jamais le contenu des
+conteneurs, sacs, livres ou cartes, ni des entités ou blocs capturés, ni le
+reste de l'inventaire. Le relais le stocke tel que validé,
 re-sérialisé, et le remet une seule fois à chaque autre joueur volontaire
 proche (48 blocs par défaut, même dimension et profil, autre partie), sous un identifiant
 opaque différent par observateur ; il note quel observateur a reçu quel clip
@@ -94,19 +109,33 @@ le chat.
 l'opérateur définit `NOCTIS_ARCHIVE_PATH` et que le relais l'annonce
 (`archive` dans `/v1/info`) : votre jeu envoie alors, avec votre accord aux
 échos, une **clé de propriétaire** aléatoire propre à ce relais et à ce compte,
-gardée dans un fichier privé de votre jeu et jamais affichée. Le relais n'en
-conserve que l'empreinte SHA-256 tronquée. Une partie de vos clips est
+gardée dans un fichier privé de votre jeu et jamais affichée, ainsi que la
+révision de cette notice que vous avez acceptée. Le relais n'en conserve que
+l'empreinte SHA-256 tronquée. Une partie de vos clips est
 gardée **sur disque** : au plus un toutes les 5 minutes et 48 par jour,
 24 par jour et par cellule de 32 × 16 × 32 blocs, ni les clips immobiles sans action. Une
 entrée contient l'empreinte de la clé, l'UUID du compte, la dimension, le
 profil de terrain, l'empreinte de la partie (SHA-256 tronqué de son
 identifiant, stable d'un redémarrage à l'autre pour ne jamais vous montrer
-vos voisins de partie), la position, la date, les mouvements, les actions et,
-si vous avez accepté le chat, ses lignes filtrées. Ni adresse IP, ni empreinte
+vos voisins de partie), la position, la date, les mouvements, les actions,
+l'équipement visible et, si vous avez accepté le chat, ses lignes filtrées. Ni adresse IP, ni empreinte
 de réseau, ni jeton. Ces clips peuvent être rejoués à d'autres joueurs
-volontaires proches, **même après votre déconnexion**, pendant
-`NOCTIS_ARCHIVE_DAYS` (92 jours par défaut) ; chaque observateur ne reçoit un
-même clip qu'une fois par session d'observateur (pendant 6 heures). Le fichier est créé avec les
+volontaires proches, **même après votre déconnexion** ; chaque observateur ne
+reçoit un même clip qu'une fois par session d'observateur (pendant 6 heures).
+
+**Durée de l'archive (révision 5).** Les clips sont rangés par zone de
+32 × 16 × 32 blocs. Une zone garde au plus `NOCTIS_ARCHIVE_CELL_MAX` clips
+(4096 par défaut, `zoneQuota` dans `/v1/info`). Dans une zone peu fréquentée,
+un clip est conservé **sans limite de durée**, sauf si l'opérateur fixe
+`NOCTIS_ARCHIVE_MAX_DAYS` (annoncé `maxAgeDays`). Une zone pleine ne remplace
+que ses propres clips les plus anciens, et seulement quand ils ont au moins
+`NOCTIS_ARCHIVE_FLOOR_DAYS` jours (92 par défaut, `ageFloorDays`) ; sinon le
+nouveau clip n'est pas archivé. Une zone n'est jamais vidée au profit d'une
+autre, et un relais plein refuse les nouveaux clips au lieu d'effacer ceux
+d'une zone calme. Les clips recueillis sous une révision antérieure, ou
+envoyés par un jeu qui n'a pas confirmé la révision 5, gardent leur durée fixe
+de `NOCTIS_ARCHIVE_DAYS` jours après leur création (92 par défaut,
+`legacyDays`). Le fichier est créé avec les
 droits 0600, en WAL avec suppression sécurisée des pages libérées.
 
 **Suppression privée.** Refuser les échos en jeu demande la suppression de
@@ -132,9 +161,10 @@ défaut, 120 s au maximum) sans renouvellement, sont purgées en continu et
 disparaissent toutes au redémarrage du relais. Un clip expire après
 `NOCTIS_ECHO_TTL` (60 s par défaut, 120 s au maximum) et la trace de remise
 après la même durée. Sans archive, rien n'est écrit sur disque ; avec, voir
-ci-dessus : les clips archivés sont purgés en continu après
-`NOCTIS_ARCHIVE_DAYS`. Ce qu'un autre joueur a déjà vu ne peut pas être
-repris.
+ci-dessus : un clip archivé reste jusqu'à son remplacement dans une zone
+pleine, l'âge maximal fixé par l'opérateur, votre suppression privée ou, pour
+les clips à durée fixe, leur échéance (purge continue). Ce qu'un autre joueur
+a déjà vu ne peut pas être repris.
 
 **Retrait.** Désactiver l'option, quitter Noctis, changer de compte ou de relais
 ferme la session, ce qui supprime aussitôt son clip, son chat et ses traces de
@@ -182,8 +212,13 @@ per session, replaced by the next one. It holds your **Minecraft account
 UUID** (no name, skin or login token), the dimension, an opaque terrain profile
 (never the seed), the random id of the running game (the relay keeps only a
 truncated SHA-256 of it), an origin position, at most 6 seconds of movement
-(relative positions, orientation, crouch/sprint/swim/swing flags) and at most
-8 block placements or breaks (relative position, block id). The relay stores
+(relative positions, orientation, crouch/sprint/swim/swing flags), at most
+8 block placements or breaks (relative position, block id) and, if the relay
+announces it, your **visible equipment**: worn or held items (armour, hands,
+back jetpack, mod slots) with their appearance data (name, lore, mod
+components), their changes and a few poses (gliding, using an item, jetpack
+thrust). Never the contents of containers, bundles, books or maps, captured
+entities or blocks, nor the rest of the inventory. The relay stores
 it as validated and re-serialised, and serves it once to each other opted-in
 player nearby (48 blocks by default, same dimension and profile, another game) under an
 opaque handle that differs per observer; it records which observer received
@@ -205,19 +240,31 @@ enabled chat.
 `NOCTIS_ARCHIVE_PATH` and the relay announces it (`archive` in `/v1/info`):
 with your echoes consent, your game then sends a random **owner key** specific
 to this relay and account, kept in a private file of your game and never
-shown. The relay keeps only its truncated SHA-256. Part of your clips is kept
+shown, and the revision of this notice you accepted. The relay keeps only the
+key's truncated SHA-256. Part of your clips is kept
 **on disk**: at most one every 5 minutes and 48 a day, 24 a day per 32 × 16 × 32-block
 area, and no idle clip without actions. An entry holds the key hash, the
 account UUID, the dimension, the terrain profile, the game fingerprint
 (truncated SHA-256 of its id, stable across relay restarts so that you are
 never shown players of your own game), the position, the date, the movements,
-the actions and, if you accepted chat, its filtered lines. No IP address,
+the actions, the visible equipment and, if you accepted chat, its filtered
+lines. No IP address,
 network fingerprint or token. These clips may be replayed to other opted-in
-players nearby **even after you left**, for `NOCTIS_ARCHIVE_DAYS` (92 days by
-default); a given observer session receives a given clip at most once (for
-6 hours). The
-file is created with mode 0600, in WAL mode with secure deletion of freed
-pages.
+players nearby **even after you left**; a given observer session receives a
+given clip at most once (for 6 hours). The file is created with mode 0600, in
+WAL mode with secure deletion of freed pages.
+
+**Archive retention (revision 5).** Clips are grouped by zone of 32 × 16 × 32
+blocks. A zone keeps at most `NOCTIS_ARCHIVE_CELL_MAX` clips (4096 by default,
+`zoneQuota` in `/v1/info`). In a zone few players visit, a clip is kept
+**without time limit**, unless the operator sets `NOCTIS_ARCHIVE_MAX_DAYS`
+(announced as `maxAgeDays`). A full zone only replaces its own oldest clips,
+and only once they are at least `NOCTIS_ARCHIVE_FLOOR_DAYS` days old (92 by
+default, `ageFloorDays`); otherwise the new clip is not archived. A zone is
+never emptied for another one, and a full relay refuses new clips instead of
+erasing those of a quiet zone. Clips collected under an earlier revision, or
+sent by a game that did not confirm revision 5, keep their fixed lifetime of
+`NOCTIS_ARCHIVE_DAYS` days after creation (92 by default, `legacyDays`).
 
 **Private deletion.** Declining echoes in game requests the deletion of
 **all** your archives on this relay; turning chat off requests that of their
@@ -238,9 +285,11 @@ guarantee: context, other languages and creative evasion get through.
 default, 120 s maximum) without renewal, are purged continuously and are all
 lost when the relay restarts. A clip expires after `NOCTIS_ECHO_TTL` (60 s by
 default, 120 s maximum) and its delivery records after the same time. Without
-an archive nothing is written to disk; with one, see above: archived clips are
-purged continuously after `NOCTIS_ARCHIVE_DAYS`. What another player has
-already seen cannot be taken back.
+an archive nothing is written to disk; with one, see above: an archived clip
+stays until it is replaced in a full zone, reaches the operator's maximum
+age, is privately deleted or, for fixed-lifetime clips, reaches its expiry
+(continuous purge). What another player has already seen cannot be taken
+back.
 
 **Withdrawal.** Turning the option off, leaving Noctis, or changing account or
 relay closes the session, which immediately deletes its clip, chat lines and

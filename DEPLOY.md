@@ -95,7 +95,7 @@ de toute façon ses propres délais et limites par client réel.
 ### Archive durable (optionnelle)
 
 À activer seulement après avoir publié la notice correspondante
-([PRIVACY.md](PRIVACY.md), révision 4).
+([PRIVACY.md](PRIVACY.md), révision 5).
 
 ```sh
 install -d -m 700 -o 10001 -g 10001 ./data   # seul chemin inscriptible du conteneur
@@ -108,10 +108,35 @@ monté sur `/data` (`deploy/compose.traefik.yaml` monte
 `../data` de même). Le fichier est créé en 0600 avec ses compagnons
 `-wal`/`-shm`, ignorés par Git. Un fichier au schéma inconnu ou illisible
 arrête le relais (code 2) : il n'est **jamais** réinitialisé ; le déplacer à
-la main pour repartir d'une archive vide. Plafonds par défaut : 4 millions de
-clips et 16 Gio (`NOCTIS_ARCHIVE_MAX_CLIPS`, `NOCTIS_ARCHIVE_MAX_MB`), refus
-au-delà sans éviction. Les sauvegardes de `./data` conservent des données que
-les joueurs ont pu supprimer : les chiffrer et les expirer dans le même délai.
+la main pour repartir d'une archive vide.
+
+Rétention par zone (révision 5) : une zone de `NOCTIS_CELL_SIZE` ×
+`NOCTIS_CELL_HEIGHT` × `NOCTIS_CELL_SIZE` blocs (32 × 16 × 32) garde au plus
+`NOCTIS_ARCHIVE_CELL_MAX` clips (4096). Une zone pleine remplace ses propres
+clips d'au moins `NOCTIS_ARCHIVE_FLOOR_DAYS` jours (92), les plus anciens
+d'abord, sinon refuse le nouveau ; une zone calme garde ses clips sans limite
+de durée, sauf `NOCTIS_ARCHIVE_MAX_DAYS` (0 = aucune, sinon ≥ le plancher).
+Plafonds globaux par défaut : 4 millions de clips et 16 Gio
+(`NOCTIS_ARCHIVE_MAX_CLIPS`, `NOCTIS_ARCHIVE_MAX_MB`) ; atteints, ils refusent
+les nouveaux clips sans jamais effacer une autre zone. Un quota inférieur à
+`NOCTIS_ARCHIVE_CELL_DAILY` × plancher (24 × 92 = 2208) est accepté mais
+signalé au démarrage : une zone fréquentée refuserait alors des clips jusqu'à
+ce que les siens atteignent le plancher. `NOCTIS_ARCHIVE_DAYS` (92) n'est plus
+que la durée fixe des clips migrés ou envoyés sans accord de la révision 5.
+Les sauvegardes de `./data` conservent des données que les joueurs ont pu
+supprimer : les chiffrer et ne les garder que le temps de leur rotation.
+
+**Mise à jour 0.4.0 → 0.5.0.** Publier d'abord la notice révision 5 et un
+client qui la présente. Arrêter le relais (`docker compose stop relay`) et
+copier `./data/archive.db` (avec `-wal`/`-shm` s'ils existent) hors de
+`./data`, en 0600 : 0.5.0 migre le fichier au schéma 2 en une transaction au
+démarrage, et 0.4.0 refuse ensuite ce fichier ; revenir en arrière demande
+cette copie. Les clips existants gardent leur échéance de création + 92 jours.
+Pour garder les visiteurs fictifs au-delà, les renouveler après le démarrage
+avec `tools/seed_previews.py --renew` (voir [tools/README.md](tools/README.md)).
+Les clips peuvent maintenant porter l'équipement visible (`gear`, désactivable
+par `NOCTIS_ECHO_GEAR=0`) ; le corps d'envoi passe à 16 Kio
+(`NOCTIS_ECHO_MAX_BODY_BYTES=16384`, maximum).
 
 ### Exploitation
 
@@ -215,7 +240,7 @@ per-real-client limits regardless.
 ### Durable archive (optional)
 
 Enable it only after publishing the matching notice
-([PRIVACY.md](PRIVACY.md), revision 4).
+([PRIVACY.md](PRIVACY.md), revision 5).
 
 ```sh
 install -d -m 700 -o 10001 -g 10001 ./data   # the container's only writable path
@@ -229,10 +254,33 @@ The container stays read-only and non-root (uid 10001); `./data` is mounted on
 The file is created with mode 0600 together with its `-wal`/`-shm` companions,
 which Git ignores. A file with an unknown schema or that cannot be read stops
 the relay (exit code 2): it is **never** reset; move it away by hand to start
-an empty archive. Default caps: 4 million clips and 16 GiB
-(`NOCTIS_ARCHIVE_MAX_CLIPS`, `NOCTIS_ARCHIVE_MAX_MB`), refusing beyond them
-without eviction. Backups of `./data` keep data players may have deleted:
-encrypt them and let them expire within the same period.
+an empty archive.
+
+Zone retention (revision 5): a zone of `NOCTIS_CELL_SIZE` ×
+`NOCTIS_CELL_HEIGHT` × `NOCTIS_CELL_SIZE` blocks (32 × 16 × 32) keeps at most
+`NOCTIS_ARCHIVE_CELL_MAX` clips (4096). A full zone replaces its own clips at
+least `NOCTIS_ARCHIVE_FLOOR_DAYS` days old (92), oldest first, otherwise
+refuses the new one; a quiet zone keeps its clips without time limit, unless
+`NOCTIS_ARCHIVE_MAX_DAYS` is set (0 = none, otherwise ≥ the floor). Default
+relay-wide caps: 4 million clips and 16 GiB (`NOCTIS_ARCHIVE_MAX_CLIPS`,
+`NOCTIS_ARCHIVE_MAX_MB`); once reached they refuse new clips and never erase
+another zone. A quota below `NOCTIS_ARCHIVE_CELL_DAILY` × floor (24 × 92 =
+2208) is accepted with a startup warning: a busy zone would then refuse clips
+until its own reach the floor. `NOCTIS_ARCHIVE_DAYS` (92) is now only the
+fixed lifetime of migrated clips and of clips sent without the revision 5
+acknowledgement. Backups of `./data` keep data players may have deleted:
+encrypt them and keep them only for their rotation period.
+
+**Upgrading 0.4.0 → 0.5.0.** First publish the revision 5 notice and a client
+that shows it. Stop the relay (`docker compose stop relay`) and copy
+`./data/archive.db` (with `-wal`/`-shm` if present) outside `./data`, mode
+0600: 0.5.0 migrates the file to schema 2 in one transaction at startup, and
+0.4.0 then refuses it; going back needs that copy. Existing clips keep their
+expiry of creation + 92 days. To keep fictional visitors beyond it, renew them
+after startup with `tools/seed_previews.py --renew` (see
+[tools/README.md](tools/README.md)). Clips may now carry visible equipment
+(`gear`, turned off by `NOCTIS_ECHO_GEAR=0`); the upload body grows to 16 KiB
+(`NOCTIS_ECHO_MAX_BODY_BYTES=16384`, the maximum).
 
 ### Operations
 

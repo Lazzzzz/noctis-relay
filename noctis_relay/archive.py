@@ -1,32 +1,47 @@
-"""Durable echo archive: sampled clips kept on disk for a fixed number of days.
+"""Durable echo archive: sampled clips kept on disk under a quota per zone.
 
 Sessions, rate limits and network fingerprints stay in memory (see store.py);
 only clips of players who opted in are archived here, under the hash of a
 random owner secret held by their game. The archive is a separate SQLite file
 in WAL mode, written from the event-loop thread only.
 
+Retention (schema 2, privacy revision 5):
+- a *zone* is one spatial cell (``cell_size`` x ``cell_height`` x
+  ``cell_size`` blocks of one realm and terrain profile). It keeps at most
+  ``cell_max`` clips. A clip arriving in a full zone replaces the oldest clips
+  *of that zone* that are at least ``floor`` old; if it has none, the clip is
+  refused. A quiet zone is therefore never emptied for a busy one, and a visit
+  younger than the floor is never discarded to make room;
+- clips of owners who acknowledged revision 5 have no time limit unless the
+  operator sets ``max_days``. Clips migrated from schema 1, and clips of
+  sessions that did not acknowledge revision 5, keep the fixed lifetime of
+  ``legacy_days`` that their notice promised (``expires`` column);
+- the relay-wide row and byte caps never delete anything by themselves: a
+  zone below its quota keeps all its clips and the new clip is refused while
+  the archive is full. Only a full zone replaces (its own clips past the
+  floor), and then takes enough of them to stay within the relay-wide caps.
+
 Bounded by construction:
 - admission samples at most one clip per owner every ``interval`` seconds and
-  caps owners and spatial cells per UTC day, cells in total and the whole
-  archive (rows and bytes). A full archive or cell refuses new clips: nothing
-  younger than the retention period is evicted to make room;
+  caps owners and zones per UTC day; making room in a full zone reads at
+  most ``REPLACE_BATCH`` of its index entries;
 - a lookup reads at most ``per_cell`` index entries in each non-empty
   neighbouring cell, starting from a random point of a random key drawn once
   per clip (a uniform sample of the cell whatever the hours people play, so a
   visit from two months ago is as likely as yesterday's), then picks a random
   person, then one of their clips. No full scan, no ORDER BY RANDOM();
-- expiry deletes at most ``purge_batch`` rows per call, oldest first, by an
-  index on the creation time (UTC wall clock, persisted).
+- expiry deletes at most ``purge_batch`` rows per call, by an index holding
+  only clips with a fixed lifetime (and, with ``max_days``, by creation time).
 
 Failure is closed: an unreadable or unknown database refuses to start and is
-never reset; a runtime error disables archiving and deletion requests answer
-503 so that clients keep retrying instead of believing their data is gone.
+never reset; a migration runs in one transaction; a runtime error disables
+archiving and deletion requests answer 503 so that clients keep retrying
+instead of believing their data is gone.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import math
 import os
@@ -40,8 +55,18 @@ from typing import Callable
 
 log = logging.getLogger("noctis_relay")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DAY = 86_400
+# Privacy revision from which an owner's clips follow the zone quota.
+QUOTA_REVISION = 5
+# Oldest same-zone clips read when a full zone makes room.
+REPLACE_BATCH = 16
+
+# Empty counter rows, so that maintenance never scans every zone or owner.
+COUNTERS = """
+CREATE INDEX cell_empty ON cell(day) WHERE total = 0;
+CREATE INDEX owner_empty ON owner(day) WHERE total = 0;
+"""
 
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
@@ -61,14 +86,17 @@ CREATE TABLE clip (
     y REAL NOT NULL,
     z REAL NOT NULL,
     size INTEGER NOT NULL,
-    shuffle INTEGER NOT NULL       -- random 31-bit key: sampling order within a cell
+    shuffle INTEGER NOT NULL,      -- random 31-bit key: sampling order within a cell
+    expires INTEGER                -- fixed end of life (UTC); NULL: kept under the zone quota
 );
 CREATE INDEX clip_cell ON clip(realm, profile, cx, cz, cy, shuffle);
+CREATE INDEX clip_zone ON clip(realm, profile, cx, cz, cy, created);
 CREATE INDEX clip_owner ON clip(owner);
 CREATE INDEX clip_created ON clip(created);
+CREATE INDEX clip_expires ON clip(expires) WHERE expires IS NOT NULL;
 -- Compressed, validated clip and its separately removable chat lines.
 CREATE TABLE body (id INTEGER PRIMARY KEY, body BLOB NOT NULL, chat TEXT);
--- Per-cell totals (lookup skips empty cells) and today's admissions.
+-- Per-zone totals (lookup skips empty cells, quota) and today's admissions.
 CREATE TABLE cell (
     realm TEXT NOT NULL, profile TEXT NOT NULL,
     cx INTEGER NOT NULL, cz INTEGER NOT NULL, cy INTEGER NOT NULL,
@@ -80,7 +108,7 @@ CREATE TABLE owner (
     owner BLOB PRIMARY KEY,
     last INTEGER NOT NULL, day INTEGER NOT NULL, today INTEGER NOT NULL, total INTEGER NOT NULL
 ) WITHOUT ROWID;
-"""
+""" + COUNTERS
 
 
 class ArchiveError(Exception):
@@ -104,11 +132,28 @@ def owner_hash(secret: str) -> bytes:
     return hashlib.sha256(secret.encode("ascii")).digest()[:16]
 
 
+def _migrate_1(db: sqlite3.Connection, legacy_days: int) -> int:
+    """Schema 1 -> 2. Its clips were collected under a fixed-duration notice and keep it."""
+    db.execute("ALTER TABLE clip ADD COLUMN expires INTEGER")
+    n = db.execute("UPDATE clip SET expires = created + ?", (legacy_days * DAY,)).rowcount
+    db.execute("CREATE INDEX clip_zone ON clip(realm, profile, cx, cz, cy, created)")
+    db.execute("CREATE INDEX clip_expires ON clip(expires) WHERE expires IS NOT NULL")
+    for statement in COUNTERS.split(";"):
+        if statement.strip():
+            db.execute(statement)
+    db.execute("UPDATE meta SET value = '2' WHERE key = 'schema'")
+    db.execute("INSERT OR REPLACE INTO meta VALUES ('migrated_from_1', ?), ('legacy_days', ?)",
+               (str(int(time.time())), str(legacy_days)))
+    return n
+
+
 class Archive:
     def __init__(
         self,
         path: str,
-        days: int = 92,
+        floor_days: int = 92,
+        max_days: int = 0,
+        legacy_days: int = 92,
         cell_size: int = 32,
         cell_height: int = 16,
         radius: int = 48,
@@ -116,7 +161,7 @@ class Archive:
         interval: int = 300,
         owner_daily: int = 48,
         cell_daily: int = 24,
-        cell_max: int = 1024,
+        cell_max: int = 4096,
         max_clips: int = 4_000_000,
         max_bytes: int = 16 * 1024 ** 3,
         min_age: int = 60,
@@ -125,8 +170,12 @@ class Archive:
         wallclock: Callable[[], float] = time.time,
         rng: random.Random | None = None,
     ) -> None:
+        if max_days and max_days < floor_days:
+            raise ArchiveError("maximum age below the age floor")
         self.path = path
-        self.retention = days * DAY
+        self.floor = floor_days * DAY
+        self.max_age = max_days * DAY
+        self.legacy = legacy_days * DAY
         self.cell_size, self.cell_height = cell_size, cell_height
         self.radius, self.vertical = radius, vertical
         self.interval = interval
@@ -138,13 +187,25 @@ class Archive:
         self.rng = rng or random.SystemRandom()
         self.failed = False
         self.span = math.ceil(radius / cell_size)
-        self.db = self._open(path, check)
+        self.db = self._open(path, check, legacy_days)
         self.rows = self.db.execute("SELECT count(*) FROM clip").fetchone()[0] if path else 0
+        self.reseed_ids()
+
+    def reseed_ids(self) -> None:
+        """Next clip id, above every id in the file (one lookup at the end of the rowid tree).
+
+        Ids are never reused while the relay runs, even once the newest clips
+        were deleted: delivery records in memory hold archive ids, and a
+        reused one would hide a new clip from observers who saw the old one.
+        Delivery records start empty at boot, so the file maximum suffices.
+        Call again after writing clips to the file directly (benchmarks).
+        """
+        self.next_id = (self.db.execute("SELECT max(id) FROM clip").fetchone()[0] or 0) + 1
 
     # -- opening ----------------------------------------------------------
 
     @staticmethod
-    def _open(path: str, check: str) -> sqlite3.Connection:
+    def _open(path: str, check: str, legacy_days: int) -> sqlite3.Connection:
         fresh = not os.path.exists(path)
         if fresh:
             directory = os.path.dirname(os.path.abspath(path))
@@ -183,8 +244,19 @@ class Archive:
                     raise ArchiveError("archive has no version: refusing to touch it")
                 row = db.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()
                 version = int(row[0]) if row and row[0].isdigit() else -1
+                if version == 1:
+                    # One transaction: a crash or error leaves schema 1 untouched.
+                    db.execute("BEGIN IMMEDIATE")
+                    try:
+                        n = _migrate_1(db, legacy_days)
+                        db.execute("COMMIT")
+                    except BaseException:
+                        db.execute("ROLLBACK")
+                        raise
+                    log.info("archive migrated to schema 2: %d earlier clips keep a fixed %d-day lifetime",
+                             n, legacy_days)
+                    version = 2
                 if version != SCHEMA_VERSION:
-                    # Future versions add migrations here, step by step, in one transaction.
                     raise ArchiveError(f"unsupported archive schema {version}")
             if check == "quick":
                 result = db.execute("PRAGMA quick_check(1)").fetchone()[0]
@@ -214,16 +286,57 @@ class Archive:
 
     # -- admission --------------------------------------------------------
 
+    _ZONE_OLDEST = (
+        "SELECT id, realm, profile, cx, cz, cy, owner, size FROM clip INDEXED BY clip_zone "
+        "WHERE realm = ? AND profile = ? AND cx = ? AND cz = ? AND cy = ? AND created <= ? "
+        "ORDER BY created LIMIT ?"
+    )
+
+    def _room(self, zone: tuple, total: int, size: int, now: int) -> list | None:
+        """Clips of ``zone`` to replace so that a new one fits, or None if it cannot.
+
+        Only a full zone replaces, and only its own clips at least ``floor``
+        old, oldest first. A zone below its quota is never thinned out: when
+        a relay-wide cap blocks it, the clip is refused. While a cap is
+        reached the zone total, the row count and (approximately) the byte
+        size never grow.
+        """
+        zone_need = total + 1 - self.cell_max
+        rows_need = self.rows + 1 - self.max_clips
+        over_bytes = self.size_bytes() + size - self.max_bytes
+        if zone_need <= 0:
+            return [] if rows_need <= 0 and over_bytes <= 0 else None
+        rows = self.db.execute(self._ZONE_OLDEST, (*zone, now - self.floor, REPLACE_BATCH)).fetchall()
+        if not rows:
+            return None
+        need = max(zone_need, rows_need)
+        if over_bytes > 0:
+            freed = 0
+            for i, row in enumerate(rows):
+                freed += row[7]
+                if freed >= over_bytes:
+                    need = max(need, i + 1)
+                    break
+            else:
+                return None
+        # A cap lowered by the operator converges by at most REPLACE_BATCH per admission.
+        return rows[:need]
+
     def admit(
         self, owner: bytes, account: str, realm: str, profile: str, instance: bytes,
-        x: float, y: float, z: float, body: str, chat: str | None,
+        x: float, y: float, z: float, body: str, chat: str | None, fixed: bool = True,
     ) -> int | None:
-        """Archive a clip if sampling and quotas allow it; returns its id or None."""
+        """Archive a clip if sampling and quotas allow it; returns its id or None.
+
+        ``fixed``: the owner did not acknowledge zone retention, so the clip
+        expires after ``legacy_days`` like under the earlier notice.
+        """
         if self.failed:
             return None
         now = self.now()
         day = now // DAY
         cx, cz, cy = self.cell_of(x, y, z)
+        zone = (realm, profile, cx, cz, cy)
         packed = zlib.compress(body.encode("utf-8"), 6)
         size = len(packed) + (len(chat) if chat else 0) + 160
         db = self.db
@@ -236,21 +349,24 @@ class Archive:
                     return None
             c = db.execute(
                 "SELECT total, day, today FROM cell WHERE realm = ? AND profile = ? AND cx = ? AND cz = ? AND cy = ?",
-                (realm, profile, cx, cz, cy),
+                zone,
             ).fetchone()
-            if c is not None and (c[0] >= self.cell_max or (c[1] == day and c[2] >= self.cell_daily)):
+            if c is not None and c[1] == day and c[2] >= self.cell_daily:
                 return None
-            if self.rows >= self.max_clips or self.size_bytes() + size > self.max_bytes:
+            victims = self._room(zone, c[0] if c is not None else 0, size, now)
+            if victims is None:
                 return None
             db.execute("BEGIN")
             try:
-                cur = db.execute(
-                    "INSERT INTO clip(realm, profile, cx, cz, cy, created, owner, account, instance, x, y, z, size, "
-                    "shuffle) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (realm, profile, cx, cz, cy, now, owner, account, instance, x, y, z, size,
-                     self.rng.getrandbits(31)),
+                if victims:
+                    self._remove(victims)
+                cid = self.next_id
+                db.execute(
+                    "INSERT INTO clip(id, realm, profile, cx, cz, cy, created, owner, account, instance, x, y, z, "
+                    "size, shuffle, expires) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (cid, *zone, now, owner, account, instance, x, y, z, size,
+                     self.rng.getrandbits(31), now + self.legacy if fixed else None),
                 )
-                cid = cur.lastrowid
                 db.execute("INSERT INTO body(id, body, chat) VALUES (?, ?, ?)", (cid, packed, chat))
                 db.execute(
                     "INSERT INTO owner(owner, last, day, today, total) VALUES (?, ?, ?, 1, 1) "
@@ -262,7 +378,7 @@ class Archive:
                     "INSERT INTO cell(realm, profile, cx, cz, cy, total, day, today) VALUES (?, ?, ?, ?, ?, 1, ?, 1) "
                     "ON CONFLICT(realm, profile, cx, cz, cy) DO UPDATE SET total = total + 1, "
                     "today = CASE WHEN day = excluded.day THEN today + 1 ELSE 1 END, day = excluded.day",
-                    (realm, profile, cx, cz, cy, day),
+                    (*zone, day),
                 )
                 db.execute("COMMIT")
             except BaseException:
@@ -271,7 +387,8 @@ class Archive:
         except sqlite3.DatabaseError as exc:
             self._fail(exc)
             return None
-        self.rows += 1
+        self.rows += 1 - len(victims)
+        self.next_id = cid + 1
         return cid
 
     # -- lookup -----------------------------------------------------------
@@ -294,7 +411,7 @@ class Archive:
         ]
 
     _PAGE = (
-        "SELECT id, owner, account, instance, x, y, z, created FROM clip INDEXED BY clip_cell "
+        "SELECT id, owner, account, instance, x, y, z, created, expires FROM clip INDEXED BY clip_cell "
         "WHERE realm = ? AND profile = ? AND cx = ? AND cz = ? AND cy = ? AND shuffle >= ? AND shuffle < ? "
         "ORDER BY shuffle LIMIT ?"
     )
@@ -308,9 +425,8 @@ class Archive:
         if self.failed:
             return None
         now = self.now()
-        oldest, newest = now - self.retention, now - self.min_age
-        if newest <= oldest:
-            return None
+        newest = now - self.min_age
+        oldest = now - self.max_age if self.max_age else None
         pivot = self.rng.getrandbits(31)
         r2, v = float(self.radius * self.radius), float(self.vertical)
         try:
@@ -321,11 +437,13 @@ class Archive:
                 if len(rows) < self.per_cell:  # wrap around
                     rows += self.db.execute(
                         self._PAGE, (*key, 0, pivot, self.per_cell - len(rows))).fetchall()
-                for cid, owner, account, instance, cxp, cyp, czp, created in rows:
+                for cid, owner, account, instance, cxp, cyp, czp, created, expires in rows:
                     if owner == exclude_owner or account == exclude_account or instance == exclude_instance:
                         continue
-                    # Expired but not yet purged, or still served live.
-                    if created < oldest or created > newest:
+                    # Still served live, or past a fixed or maximum age but not yet purged.
+                    if created > newest or (expires is not None and expires <= now):
+                        continue
+                    if oldest is not None and created < oldest:
                         continue
                     if (cxp - x) ** 2 + (czp - z) ** 2 > r2 or abs(cyp - y) > v or delivered(cid):
                         continue
@@ -342,12 +460,24 @@ class Archive:
             return None
         return Archived(cid, account, created, cxp, cyp, czp, zlib.decompress(row[0]).decode("utf-8"), row[1])
 
+    _ROWS = "SELECT id, realm, profile, cx, cz, cy, owner FROM clip "
+    _EXPIRED = _ROWS + "INDEXED BY clip_expires WHERE expires IS NOT NULL AND expires <= ? ORDER BY expires LIMIT ?"
+    _TOO_OLD = _ROWS + "INDEXED BY clip_created WHERE created < ? ORDER BY created LIMIT ?"
+    _IDLE_OWNERS = ("DELETE FROM owner WHERE owner IN (SELECT owner FROM owner INDEXED BY owner_empty "
+                    "WHERE total = 0 AND day < ? LIMIT ?)")
+    _EMPTY_CELLS = ("DELETE FROM cell WHERE (realm, profile, cx, cz, cy) IN (SELECT realm, profile, cx, cz, cy "
+                    "FROM cell INDEXED BY cell_empty WHERE total = 0 AND day < ? LIMIT ?)")
+
     def explain(self) -> list[str]:
         plans = []
         for sql, params in (
             (self._PAGE, ("r", "p", 0, 0, 0, 0, 1 << 31, 8)),
-            ("SELECT id FROM clip WHERE created < ? ORDER BY created LIMIT ?", (0, 10)),
-            ("SELECT id FROM clip WHERE owner = ?", (b"",)),
+            (self._ZONE_OLDEST, ("r", "p", 0, 0, 0, 0, REPLACE_BATCH)),
+            (self._EXPIRED, (0, 10)),
+            (self._TOO_OLD, (0, 10)),
+            (self._ROWS + "WHERE owner = ?", (b"",)),
+            (self._IDLE_OWNERS, (0, 10)),
+            (self._EMPTY_CELLS, (0, 10)),
         ):
             plans += [r[3] for r in self.db.execute("EXPLAIN QUERY PLAN " + sql, params)]
         return plans
@@ -355,11 +485,11 @@ class Archive:
     # -- deletion and expiry ----------------------------------------------
 
     def _remove(self, rows: list) -> None:
-        """Delete clips (id, realm, profile, cx, cz, cy, owner) and keep counters exact."""
+        """Delete clips (id, realm, profile, cx, cz, cy, owner, ...) and keep counters exact."""
         db = self.db
         cells: dict = {}
         owners: dict = {}
-        for cid, realm, profile, cx, cz, cy, owner in rows:
+        for cid, realm, profile, cx, cz, cy, owner, *_ in rows:
             cells[(realm, profile, cx, cz, cy)] = cells.get((realm, profile, cx, cz, cy), 0) + 1
             owners[owner] = owners.get(owner, 0) + 1
         db.executemany("DELETE FROM body WHERE id = ?", ((r[0],) for r in rows))
@@ -369,8 +499,6 @@ class Archive:
                        "AND cz = ? AND cy = ?", (n, *key))
         for owner, n in owners.items():
             db.execute("UPDATE owner SET total = max(0, total - ?) WHERE owner = ?", (n, owner))
-
-    _ROWS = "SELECT id, realm, profile, cx, cz, cy, owner FROM clip "
 
     def forget(self, owner: bytes, chat_only: bool) -> int:
         """Private deletion by owner. Raises ArchiveError if the archive is unavailable."""
@@ -403,14 +531,21 @@ class Archive:
         return n
 
     def purge(self, limit: int = 200) -> int:
-        """Remove at most ``limit`` clips older than the retention period, oldest first."""
+        """Remove at most ``limit`` clips past their fixed lifetime or the maximum age.
+
+        Clips kept under the zone quota are never touched here: a quiet zone
+        keeps its old visits, only new clips of the same zone replace them.
+        """
         if self.failed:
             return 0
         now = self.now()
         db = self.db
         try:
-            rows = db.execute(self._ROWS + "WHERE created < ? ORDER BY created LIMIT ?",
-                              (now - self.retention, limit)).fetchall()
+            rows = db.execute(self._EXPIRED, (now, limit)).fetchall()
+            if self.max_age and len(rows) < limit:
+                seen = {r[0] for r in rows}
+                rows += [r for r in db.execute(self._TOO_OLD, (now - self.max_age, limit - len(rows)))
+                         if r[0] not in seen]
             if rows:
                 db.execute("BEGIN")
                 try:
@@ -422,12 +557,8 @@ class Archive:
                 self.rows -= len(rows)
             # Counter rows of quiet owners/cells, bounded as well.
             day = now // DAY
-            db.execute(
-                "DELETE FROM owner WHERE owner IN (SELECT owner FROM owner WHERE total = 0 AND day < ? LIMIT ?)",
-                (day - 1, limit))
-            db.execute(
-                "DELETE FROM cell WHERE (realm, profile, cx, cz, cy) IN (SELECT realm, profile, cx, cz, cy "
-                "FROM cell WHERE total = 0 AND day < ? LIMIT ?)", (day - 1, limit))
+            db.execute(self._IDLE_OWNERS, (day - 1, limit))
+            db.execute(self._EMPTY_CELLS, (day - 1, limit))
         except sqlite3.DatabaseError as exc:
             self._fail(exc)
             return 0

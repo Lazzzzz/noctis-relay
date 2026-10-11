@@ -135,7 +135,9 @@ class Config:
     echo_radius: int = 48
     echo_vertical: int = 16
     echo_max_per_cell: int = 32
-    echo_max_body_bytes: int = 6144
+    echo_max_body_bytes: int = 16_384
+    # Optional visible equipment of the replayed body (see equipment.py).
+    echo_gear_enabled: bool = True
     echo_publish_interval: float = 20.0
     echo_fetch_interval: float = 20.0
     # Fastest accepted movement in a clip, in blocks per tick.
@@ -145,11 +147,19 @@ class Config:
     global_echo_burst: int = 400
     # Durable archive of sampled clips from opted-in owners ("" = off).
     archive_path: str = ""
+    # Fixed lifetime of clips collected under privacy revision 4 (migrated
+    # schema-1 clips, sessions that did not acknowledge revision 5).
     archive_days: int = 92
+    # Zone retention: a full zone only replaces its own clips at least
+    # archive_floor_days old; archive_max_days 0 means no time limit.
+    archive_floor_days: int = 92
+    archive_max_days: int = 0
     archive_interval: int = 300
     archive_owner_daily: int = 48
     archive_cell_daily: int = 24
-    archive_cell_max: int = 1024
+    # Quota per zone (one cell): at least archive_cell_daily x
+    # archive_floor_days so that a busy zone never fills with young clips.
+    archive_cell_max: int = 4096
     archive_max_clips: int = 4_000_000
     archive_max_bytes: int = 16 * 1024 ** 3
     archive_rate: float = 3.0
@@ -172,6 +182,8 @@ class Config:
             raise ConfigError("NOCTIS_ARCHIVE_PATH requires NOCTIS_ECHOES")
         if self.archive_check not in ("off", "quick"):
             raise ConfigError("NOCTIS_ARCHIVE_CHECK must be off or quick")
+        if self.archive_max_days and self.archive_max_days < self.archive_floor_days:
+            raise ConfigError("NOCTIS_ARCHIVE_MAX_DAYS must be 0 or at least NOCTIS_ARCHIVE_FLOOR_DAYS")
 
 
 def load_deny_file(path: str) -> list:
@@ -244,7 +256,8 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         echo_radius=_int(env, "NOCTIS_ECHO_RADIUS", 48, 8, 128),
         echo_vertical=_int(env, "NOCTIS_ECHO_VERTICAL", 16, 0, 128),
         echo_max_per_cell=_int(env, "NOCTIS_ECHO_MAX_PER_CELL", 32, 0, 100_000),
-        echo_max_body_bytes=_int(env, "NOCTIS_ECHO_MAX_BODY_BYTES", 6144, 1024, 16_384),
+        echo_max_body_bytes=_int(env, "NOCTIS_ECHO_MAX_BODY_BYTES", 16_384, 1024, 16_384),
+        echo_gear_enabled=_bool(env, "NOCTIS_ECHO_GEAR", True),
         echo_publish_interval=_float(env, "NOCTIS_ECHO_PUBLISH_INTERVAL", 20.0, 1.0, 3600.0),
         echo_fetch_interval=_float(env, "NOCTIS_ECHO_FETCH_INTERVAL", 20.0, 1.0, 3600.0),
         echo_max_speed=_float(env, "NOCTIS_ECHO_MAX_SPEED", 1.2, 0.1, 4.0),
@@ -253,10 +266,12 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         global_echo_burst=_int(env, "NOCTIS_GLOBAL_ECHO_BURST", 400, 1, 10_000_000),
         archive_path=env.get("NOCTIS_ARCHIVE_PATH", "").strip(),
         archive_days=_int(env, "NOCTIS_ARCHIVE_DAYS", 92, 1, 3650),
+        archive_floor_days=_int(env, "NOCTIS_ARCHIVE_FLOOR_DAYS", 92, 1, 3650),
+        archive_max_days=_int(env, "NOCTIS_ARCHIVE_MAX_DAYS", 0, 0, 3650),
         archive_interval=_int(env, "NOCTIS_ARCHIVE_INTERVAL", 300, 0, 86_400),
         archive_owner_daily=_int(env, "NOCTIS_ARCHIVE_OWNER_DAILY", 48, 1, 100_000),
         archive_cell_daily=_int(env, "NOCTIS_ARCHIVE_CELL_DAILY", 24, 1, 100_000),
-        archive_cell_max=_int(env, "NOCTIS_ARCHIVE_CELL_MAX", 1024, 1, 1_000_000),
+        archive_cell_max=_int(env, "NOCTIS_ARCHIVE_CELL_MAX", 4096, 1, 1_000_000),
         archive_max_clips=_int(env, "NOCTIS_ARCHIVE_MAX_CLIPS", 4_000_000, 1, 1_000_000_000),
         archive_max_bytes=_int(env, "NOCTIS_ARCHIVE_MAX_MB", 16_384, 1, 16_777_216) * 1024 * 1024,
         archive_rate=_float(env, "NOCTIS_ARCHIVE_RATE", 3.0, 0.0, 100_000.0),
