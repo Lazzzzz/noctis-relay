@@ -20,7 +20,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from noctis_relay.store import Store  # noqa: E402
+from noctis_relay.store import AreaFullError, Store  # noqa: E402
 
 REALM = "astralyth:noctis"
 PROFILES = ["gen1-profile-a", "gen1-profile-b", "gen1-profile-c", "gen1-profile-d"]
@@ -61,7 +61,10 @@ def populate(store, rng, spread, hot, hot_radius=64.0):
             a, d = rng.uniform(0, 2 * math.pi), hot_radius * math.sqrt(rng.random())
             x, z, y = d * math.cos(a), d * math.sin(a), rng.uniform(60, 80)
         inst = "inst-%012d" % i
-        store.update_presence(s, REALM, prof, inst, x, y, z)
+        try:
+            store.update_presence(s, REALM, prof, inst, x, y, z)
+        except AreaFullError:  # cell already at the per-cell cap: not admitted
+            continue
         players.append([s, prof, inst, x, y, z, i >= spread])
     return players
 
@@ -90,7 +93,10 @@ def run(args):
         p[5] += rng.uniform(-4, 4)
         p[4] = min(4096, max(-2048, p[4] + rng.uniform(-1, 1)))
         s0 = time.perf_counter()
-        _, near = store.update_presence(p[0], REALM, p[1], p[2], p[3], p[4], p[5])
+        try:
+            _, near = store.update_presence(p[0], REALM, p[1], p[2], p[3], p[4], p[5])
+        except AreaFullError:  # moved into a full cell: refused, nothing changed
+            near = []
         dt = time.perf_counter() - s0
         (hot_lat if p[6] else spread_lat).append(dt)
         (nearby_hot if p[6] else nearby_spread).append(len(near))
@@ -144,18 +150,20 @@ def run(args):
     store.close()
 
     print("\nhot-zone density (all players inside 64 blocks, one profile):")
-    for n in args.density:
-        st = Store(30, 1_000_000, clock=clock)
-        pl = populate(st, random.Random(args.seed), 0, n)
-        lat = []
-        for _ in range(1000):
-            clock.t += 0.0005
-            p = pl[rng.randrange(len(pl))]
-            s0 = time.perf_counter()
-            st.update_presence(p[0], REALM, p[1], p[2], p[3], p[4], p[5])
-            lat.append(time.perf_counter() - s0)
-        print(f"  {n:5d} players: {fmt(lat)}")
-        st.close()
+    for cap in (0, args.max_per_cell):
+        label = "no cell cap" if not cap else f"cell cap {cap}"
+        for n in args.density:
+            st = Store(30, 1_000_000, clock=clock, max_per_cell=cap)
+            pl = populate(st, random.Random(args.seed), 0, n)
+            lat = []
+            for _ in range(1000):
+                clock.t += 0.0005
+                p = pl[rng.randrange(len(pl))]
+                s0 = time.perf_counter()
+                st.update_presence(p[0], REALM, p[1], p[2], p[3], p[4], p[5])
+                lat.append(time.perf_counter() - s0)
+            print(f"  {label:12s} {n:5d} attempted, {len(pl):5d} admitted: {fmt(lat)}")
+            st.close()
 
 
 def main():
@@ -165,6 +173,7 @@ def main():
     ap.add_argument("--updates", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--density", type=int, nargs="*", default=[50, 200, 1000, 3000])
+    ap.add_argument("--max-per-cell", type=int, default=64, help="cap used for the second density pass")
     run(ap.parse_args())
 
 

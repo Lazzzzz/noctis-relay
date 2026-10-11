@@ -1,0 +1,30 @@
+services:
+  relay:
+    container_name: noctis-relay
+    build: ..
+    env_file: ../.env
+    environment:
+      NOCTIS_HOST: 0.0.0.0
+      NOCTIS_PORT: "8787"
+      NOCTIS_DENY_FILE: /etc/noctis/deny-networks.txt
+      NOCTIS_TRUST_PROXY: "1"
+      NOCTIS_TRUSTED_PROXIES: "${NOCTIS_TRUSTED_PROXIES:?Set the exact trusted proxy CIDR in .env}"
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./config:/etc/noctis:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1.0
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: "1m", max-file: "3"}
+    networks: [proxy]
+networks:
+  proxy:
+    external: true
+    name: ${NOCTIS_PROXY_NETWORK:-proxy-network}

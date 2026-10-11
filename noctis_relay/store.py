@@ -23,9 +23,14 @@ CREATE TABLE session (
     token_hash BLOB NOT NULL UNIQUE,
     expires REAL NOT NULL,
     presence INTEGER NOT NULL DEFAULT 0,
-    last_presence REAL NOT NULL DEFAULT -1e300
+    last_presence REAL NOT NULL DEFAULT -1e300,
+    -- Keyed fingerprint of the client network that last used the session
+    -- (never an address; the key is random per process). Overwritten, not
+    -- appended: no history is kept.
+    net BLOB NOT NULL DEFAULT x''
 );
 CREATE INDEX session_expires ON session(expires);
+CREATE INDEX session_net ON session(net, expires);
 
 -- Clustered on the spatial key: a neighbour lookup is a handful of B-tree
 -- seeks (one per horizontal cell) followed by a short range on cy.
@@ -60,6 +65,7 @@ class Session:
     expires: float
     presence: bool
     last_presence: float
+    net: bytes = b""
 
 
 @dataclass(frozen=True)
@@ -75,6 +81,10 @@ class CapacityError(Exception):
     pass
 
 
+class AreaFullError(Exception):
+    """The target presence cell already holds its maximum of live positions."""
+
+
 class Store:
     def __init__(
         self,
@@ -86,6 +96,7 @@ class Store:
         near_vertical: int = 12,
         near_limit: int = 8,
         clock: Callable[[], float] = time.monotonic,
+        max_per_cell: int = 0,
     ) -> None:
         self.retention = float(retention_seconds)
         self.max_sessions = max_sessions
@@ -94,6 +105,7 @@ class Store:
         self.near_radius = near_radius
         self.near_vertical = near_vertical
         self.near_limit = near_limit
+        self.max_per_cell = max_per_cell
         self.clock = clock
         self._ref_key = secrets.token_bytes(32)
         self.db = sqlite3.connect(":memory:", isolation_level=None, check_same_thread=False)
@@ -109,7 +121,13 @@ class Store:
     def session_count(self) -> int:
         return self._session_rows
 
-    def create_session(self, presence: bool = False) -> tuple[str, Session]:
+    def network_sessions(self, net: bytes) -> int:
+        """Live sessions attributed to ``net`` (index range, no table scan)."""
+        return self.db.execute(
+            "SELECT count(*) FROM session WHERE net = ? AND expires > ?", (net, self.clock())
+        ).fetchone()[0]
+
+    def create_session(self, presence: bool = False, net: bytes = b"") -> tuple[str, Session]:
         now = self.clock()
         if self._session_rows >= self.max_sessions:
             # Reclaim a bounded batch even at capacity; periodic maintenance
@@ -120,32 +138,34 @@ class Store:
         token = secrets.token_hex(32)
         expires = now + self.retention
         cur = self.db.execute(
-            "INSERT INTO session(token_hash, expires, presence) VALUES (?, ?, ?)",
-            (hash_token(token), expires, 1 if presence else 0),
+            "INSERT INTO session(token_hash, expires, presence, net) VALUES (?, ?, ?, ?)",
+            (hash_token(token), expires, 1 if presence else 0, net),
         )
         self._session_rows += 1
-        return token, Session(cur.lastrowid, expires, presence, -1e300)
+        return token, Session(cur.lastrowid, expires, presence, -1e300, net)
 
     def find_session(self, token: str) -> Session | None:
         row = self.db.execute(
-            "SELECT sid, expires, presence, last_presence FROM session WHERE token_hash = ?",
+            "SELECT sid, expires, presence, last_presence, net FROM session WHERE token_hash = ?",
             (hash_token(token),),
         ).fetchone()
         if row is None or row[1] <= self.clock():
             return None
-        return Session(row[0], row[1], bool(row[2]), row[3])
+        return Session(row[0], row[1], bool(row[2]), row[3], row[4])
 
-    def refresh_session(self, token: str) -> Session | None:
+    def refresh_session(self, session: Session, net: bytes | None = None) -> Session | None:
+        """Extend a live session and attribute it to ``net`` (if given)."""
         now = self.clock()
         expires = now + self.retention
+        net = session.net if net is None else net
         row = self.db.execute(
-            "UPDATE session SET expires = ? WHERE token_hash = ? AND expires > ? "
+            "UPDATE session SET expires = ?, net = ? WHERE sid = ? AND expires > ? "
             "RETURNING sid, presence, last_presence",
-            (expires, hash_token(token), now),
+            (expires, net, session.sid, now),
         ).fetchone()
         if row is None:
             return None
-        return Session(row[0], expires, bool(row[1]), row[2])
+        return Session(row[0], expires, bool(row[1]), row[2], net)
 
     def delete_session(self, token: str) -> bool:
         db = self.db
@@ -212,9 +232,15 @@ class Store:
         x: float,
         y: float,
         z: float,
+        net: bytes | None = None,
     ) -> tuple[float, list[Neighbour]]:
-        """Upsert the caller's position, refresh its session and return neighbours."""
+        """Upsert the caller's position, refresh its session and return neighbours.
+
+        Raises AreaFullError, without any change, if the position enters a
+        cell that already holds ``max_per_cell`` live positions.
+        """
         now = self.clock()
+        net = session.net if net is None else net
         expires = now + self.retention
         inst = hashlib.sha256(instance.encode("ascii")).digest()[:16]
         cx, cz, cy = self.cell_of(x, y, z)
@@ -222,8 +248,8 @@ class Store:
         db.execute("BEGIN")
         try:
             db.execute(
-                "UPDATE session SET expires = ?, last_presence = ? WHERE sid = ?",
-                (expires, now, session.sid),
+                "UPDATE session SET expires = ?, last_presence = ?, net = ? WHERE sid = ?",
+                (expires, now, net, session.sid),
             )
             cur = db.execute(
                 "UPDATE presence SET x = ?, y = ?, z = ?, expires = ?, instance = ? "
@@ -231,6 +257,12 @@ class Store:
                 (x, y, z, expires, inst, session.sid, realm, profile, cx, cz, cy),
             )
             if cur.rowcount == 0:
+                if self.max_per_cell and db.execute(
+                    "SELECT count(*) FROM (SELECT 1 FROM presence WHERE realm = ? AND profile = ? "
+                    "AND cx = ? AND cz = ? AND cy = ? AND expires > ? LIMIT ?)",
+                    (realm, profile, cx, cz, cy, now, self.max_per_cell),
+                ).fetchone()[0] >= self.max_per_cell:
+                    raise AreaFullError()
                 db.execute("DELETE FROM presence WHERE sid = ?", (session.sid,))
                 db.execute(
                     "INSERT INTO presence(realm, profile, cx, cz, cy, sid, instance, x, y, z, expires) "

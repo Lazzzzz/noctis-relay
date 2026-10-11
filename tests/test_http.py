@@ -128,14 +128,14 @@ class ConnectionCapTest(unittest.TestCase):
 class ProxyAndConfigTest(unittest.TestCase):
     def test_forwarded_header_ignored_by_default(self):
         cfg = make_config()
-        self.assertEqual(_resolve_client(cfg, "203.0.113.5", {"x-forwarded-for": "198.51.100.1"}), "203.0.113.5")
+        self.assertEqual(str(_resolve_client(cfg, "203.0.113.5", {"x-forwarded-for": "198.51.100.1"})), "203.0.113.5")
 
     def test_forwarded_header_from_trusted_proxy(self):
         cfg = make_config(trust_proxy=True, trusted_proxies=(ipaddress.ip_network("127.0.0.1/32"),))
         hdr = {"x-forwarded-for": "6.6.6.6, 198.51.100.1"}
-        self.assertEqual(_resolve_client(cfg, "127.0.0.1", hdr), "198.51.100.1")
-        self.assertEqual(_resolve_client(cfg, "203.0.113.5", hdr), "203.0.113.5")
-        self.assertEqual(_resolve_client(cfg, "127.0.0.1", {"x-forwarded-for": "junk"}), "127.0.0.1")
+        self.assertEqual(str(_resolve_client(cfg, "127.0.0.1", hdr)), "198.51.100.1")
+        self.assertEqual(str(_resolve_client(cfg, "203.0.113.5", hdr)), "203.0.113.5")
+        self.assertEqual(str(_resolve_client(cfg, "127.0.0.1", {"x-forwarded-for": "junk"})), "127.0.0.1")
 
     def test_ipv6_grouping(self):
         self.assertEqual(client_key("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::/64")

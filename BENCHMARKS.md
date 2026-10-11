@@ -6,11 +6,19 @@ Reproduce with:
 python3 bench/bench_spatial.py            # SQLite store only, in process
 python3 bench/bench_http.py               # real relay process, closed loop
 python3 bench/bench_http.py --clients 2000 --hot 300 --interval 1 --seconds 15
+python3 bench/bench_abuse.py --attack none|single|rotate|create|slow --seconds 8
+python3 bench/bench_abuse.py --attack rotate --warmup 1.5 --check   # fails if a player is degraded
+python3 bench/bench_spatial.py --max-per-cell 64   # density pass with the cell cap
 ```
 
-The HTTP benchmark runs client and server on the same machine and shares one
-source address (its rate limits are raised for that reason only). Numbers are
-indicative for one host; they are **not** a promise of world-scale capacity.
+`bench_http.py` runs client and server on the same machine and shares one
+source address: it **lifts every abuse limit** (per-client and per-prefix
+rates, per-network session cap, per-session and relay-wide budgets, sockets
+per peer, in-progress requests, per-cell cap) so that it measures capacity,
+not the limits. `bench_abuse.py` keeps the **default** limits and only trusts
+127.0.0.1 as reverse proxy, so that `X-Forwarded-For` emulates distinct client
+networks. Numbers are indicative for one host; they are **not** a promise of
+world-scale capacity, nor of protection against network-level DDoS.
 
 ## 2026-10-11 — Apple M4 Pro (14 cores), Python 3.12.14, SQLite 3.53.4
 
@@ -61,6 +69,73 @@ often that cost is paid.
 
 All responses were `200`. In closed loop the latency is queueing: clients send
 as fast as the single server thread answers.
+
+## 2026-10-11 — relay 0.2.0 (abuse limits), same machine, heavy load
+
+Taken while other heavy jobs were running (load average ≈ 17–28): tails are
+inflated, compare with the heavy-load columns above.
+
+### Default budgets introduced in 0.2.0
+
+| Setting | Default | Before |
+|---|---|---|
+| `NOCTIS_CREATE_PREFIX_RATE` / `_BURST` (per IPv4 /24 or IPv6 /48) | 0.5/s, 24 | none |
+| `NOCTIS_MAX_SESSIONS_PER_NETWORK` (IPv4 or /64) | 16 | none |
+| `NOCTIS_SESSION_REQUEST_RATE` / `_BURST` (per session) | 2/s, 20 | none |
+| `NOCTIS_GLOBAL_REQUEST_RATE` / `_BURST` (anonymous requests) | 2 000/s, 4 000 | none |
+| `NOCTIS_GLOBAL_CREATE_RATE` / `_BURST` | 50/s, 500 | none |
+| `NOCTIS_GLOBAL_PRESENCE_RATE` / `_BURST` | 1 000/s, 2 000 | none |
+| `NOCTIS_MAX_CONNECTIONS_PER_PEER` (trusted proxies exempt) | 32 | none (only the global socket cap) |
+| `NOCTIS_MAX_INFLIGHT_PER_CLIENT` | 8 | none |
+| `NOCTIS_PRESENCE_MAX_PER_CELL` | 64 | none |
+
+Per-client request and creation rates are unchanged. `0` disables each new
+limit.
+
+### Players under attack (`bench_abuse.py`, 8 s, 200 players heartbeating every second, 64 attacker connections, default limits)
+
+| Attack | Players | Heartbeat p50 / p95 | Attacker obtained | Server RSS |
+|---|---|---|---|---|
+| none | every heartbeat `200` | 0.55 / 4.5 ms | — | 20 MiB |
+| one address flooding `GET /v1/info` (≈ 21 000 attempts/s) | every heartbeat `200` | 2.8 / 21 ms | 79 × `200`, the rest `429` | 21 MiB |
+| fresh address on every request | every heartbeat `200`; late creations: 176 × `201`, 470 × `503` | 2.4 / 18 ms | 19 817 × `200`, 181 124 × `503` | 35 MiB |
+| session-creation flood, rotating addresses | every heartbeat `200`; late creations: 30 × `201`, 1 372 × `503` | 2.3 / 3.7 ms | 869 sessions, 95 935 × `503` | 46 MiB |
+| slow bodies from one address | every heartbeat `200` | — | 109 318 × `429`, 8 sockets cut at body timeout | 25 MiB |
+
+Existing sessions are admitted on their own per-session budget, so anonymous
+floods do not starve them. What a rotating attacker **does** obtain is the
+relay-wide creation budget: players who try to open a session during the
+flood get `503` with `Retry-After` until it stops.
+
+### Spatial store with the `net` column (5 000 presences, 500 in the hot zone)
+
+| Measure | 0.2.0, heavy load |
+|---|---|
+| Presence update, single thread | 15 600 ops/s |
+| — spread / hot-zone players p50 | 43 / 148 µs |
+| SQLite pages | ≈ 443 B per player (≈ 410 before: network fingerprint and its index) |
+| Purge of 5 000 expired players | 17.2 ms |
+
+Density (all players within 64 blocks), update p50 / p95:
+
+| Attempted | no cell cap | cell cap 64 (admitted) |
+|---|---|---|
+| 1 000 | — | 216 µs p50 (977 admitted) |
+| 3 000 | 535 / 911 µs | 316 / 1 833 µs (1 635 admitted) |
+
+With the cap, a cell holds at most 64 presences, so the neighbour search of a
+caller examines at most 5 × 5 × 3 × 64 = 4 800 rows whatever the crowd; the
+p95 above is load noise.
+
+### HTTP capacity, limits lifted (`bench_http.py`)
+
+| Scenario | Throughput | Statuses | Server RSS |
+|---|---|---|---|
+| 100 clients, closed loop | 9 350 req/s | all `200` | 20 MiB |
+| 1 000 clients, one request every 0.5 s | 1 900 req/s (presence p50 3.4 ms, p95 163 ms) | all `200` | — |
+
+The extra admission work (fingerprint, session lookup before the body) stays
+within the load noise of the earlier heavy-load runs.
 
 ### Reading the numbers
 

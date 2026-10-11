@@ -3,7 +3,7 @@
     python3 bench/bench_http.py [--clients 200] [--seconds 10]
 
 Starts ``python -m noctis_relay`` in a subprocess (presence enabled, rate
-limits raised for the benchmark only), opens one keep-alive connection per
+limits, per-network caps and global budgets lifted for the benchmark only), opens one keep-alive connection per
 simulated player and alternates presence updates and heartbeats as fast as
 possible. Reports throughput, latency percentiles and the server's RSS.
 Client and server share the machine, so numbers are a lower bound.
@@ -90,8 +90,20 @@ async def player(i, port, deadline, hot, lat, statuses, rng, interval):
 
 
 def rss_mb(pid):
-    out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
-    return int(out) / 1024 if out else float("nan")
+    # Linux containers need no procps package just to measure their RSS.
+    try:
+        with open(f"/proc/{pid}/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except (OSError, ValueError):
+        pass
+    try:
+        out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout.strip()
+        return int(out) / 1024 if out else float("nan")
+    except (OSError, ValueError):
+        return float("nan")
 
 
 async def main_async(args):
@@ -110,6 +122,18 @@ async def main_async(args):
         "NOCTIS_CREATE_BURST": "100000",
         "NOCTIS_MAX_CONNECTIONS": str(args.clients + 10),
         "NOCTIS_MAX_REQUESTS_PER_CONNECTION": "10000",
+        # Every simulated player shares 127.0.0.1: per-network caps and the
+        # relay-wide budgets are lifted so the benchmark measures capacity,
+        # not the abuse limits (see bench_abuse.py for those).
+        "NOCTIS_CREATE_PREFIX_RATE": "0",
+        "NOCTIS_MAX_SESSIONS_PER_NETWORK": "0",
+        "NOCTIS_GLOBAL_REQUEST_RATE": "0",
+        "NOCTIS_SESSION_REQUEST_RATE": "0",
+        "NOCTIS_GLOBAL_CREATE_RATE": "0",
+        "NOCTIS_GLOBAL_PRESENCE_RATE": "0",
+        "NOCTIS_MAX_CONNECTIONS_PER_PEER": "0",
+        "NOCTIS_MAX_INFLIGHT_PER_CLIENT": "0",
+        "NOCTIS_PRESENCE_MAX_PER_CELL": "0",
     }
     proc = subprocess.Popen([sys.executable, "-m", "noctis_relay"], env=env, cwd=ROOT,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

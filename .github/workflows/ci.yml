@@ -25,6 +25,8 @@ jobs:
         run: python bench/bench_spatial.py --players 2000 --hot 200 --updates 5000 --density 200
       - name: HTTP benchmark (smoke)
         run: python bench/bench_http.py --clients 50 --seconds 3
+      - name: Players under a rotating flood, default limits (smoke)
+        run: python bench/bench_abuse.py --attack rotate --players 50 --attackers 16 --warmup 1.5 --seconds 4 --check
 
   docker:
     runs-on: ubuntu-latest

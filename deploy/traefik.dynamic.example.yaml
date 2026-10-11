@@ -1,0 +1,23 @@
+http:
+  routers:
+    noctis-relay-https:
+      rule: Host(`relay.example.org`)
+      entryPoints: [https]
+      service: noctis-relay
+      tls:
+        certResolver: letsencrypt
+    noctis-relay-http:
+      rule: Host(`relay.example.org`)
+      entryPoints: [http]
+      service: noctis-relay
+      middlewares: [noctis-relay-https]
+  middlewares:
+    noctis-relay-https:
+      redirectScheme:
+        scheme: https
+        permanent: true
+  services:
+    noctis-relay:
+      loadBalancer:
+        servers:
+          - url: http://noctis-relay:8787

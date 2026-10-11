@@ -22,8 +22,9 @@ s'il est activé), le refermer après l'essai, puis remettre
 `NOCTIS_PUBLISH=127.0.0.1`. Docker publie ses ports avant les règles `ufw` :
 c'est `NOCTIS_PUBLISH` qui contrôle réellement l'exposition.
 
-Côté jeu, saisir `http://<IP_DU_VPS>:8787` comme adresse du relais et autoriser
-explicitement « HTTP distant » pour cet essai.
+Dans `config/astralyth-noctis-client.toml`, définir
+`relayUrl = "http://<IP_DU_VPS>:8787"` et `allowInsecureHttp = true` pour cet
+essai. L’adresse et HTTP ne sont pas modifiables en jeu.
 
 ### 2. HTTPS avec un domaine
 
@@ -36,17 +37,68 @@ explicitement « HTTP distant » pour cet essai.
 Caddy obtient et renouvelle le certificat automatiquement, n'écrit pas de
 journal d'accès et remplace tout `X-Forwarded-For` reçu par l'adresse réelle ;
 le relais ne fait confiance à cet en-tête que depuis le conteneur Caddy.
-Limite connue : le réseau Docker du compose est en IPv4 ; selon la
-configuration de Docker, les clients arrivant en IPv6 peuvent apparaître sous
-l'adresse de la passerelle Docker et partager une même limite de débit. Activer
-IPv6 dans Docker ou placer Caddy sur l'hôte si l'IPv6 compte.
+
+**IPv6, à vérifier avant d'ouvrir le service.** Le réseau Docker du compose est
+en IPv4 ; selon la configuration de Docker (`userland-proxy`), les clients
+arrivant en IPv6 peuvent apparaître sous l'adresse de la passerelle Docker. Ils
+partageraient alors un seul « réseau » : même débit et, surtout, au plus
+`NOCTIS_MAX_SESSIONS_PER_NETWORK` (16) sessions actives pour tous les joueurs
+IPv6. Solutions : activer IPv6 dans Docker, placer Caddy sur l'hôte, ou ne pas
+publier d'enregistrement `AAAA`. Contrôle : ouvrir deux sessions depuis deux
+accès IPv6 différents puis vérifier, avec un réglage temporaire
+`NOCTIS_MAX_SESSIONS_PER_NETWORK=1`, que la seconde est acceptée.
+
+### Limites contre les abus
+
+Les valeurs par défaut (voir `.env.example` et la section *Errors and limits*
+de [PROTOCOL.md](PROTOCOL.md#errors-and-limits)) visent un relais
+communautaire : 16 sessions actives par réseau (IPv4 ou /64 IPv6), budgets
+globaux de 2 000 requêtes, 50 créations et 1 000 positions par seconde, 32
+sockets par pair direct, 8 requêtes en cours par client réel. Derrière un NAT
+d'établissement ou un CGNAT, relever `NOCTIS_MAX_SESSIONS_PER_NETWORK`,
+`NOCTIS_REQUEST_RATE` et `NOCTIS_CREATE_RATE`. Tout réglage à `0` désactive la
+limite correspondante. Les réponses `429`/`503` portent `Retry-After`.
+
+**Blocage par l'opérateur.** `NOCTIS_DENY_NETWORKS` (liste d'adresses ou CIDR)
+dans `.env`, appliqué au redémarrage, ou un fichier rechargeable sans
+redémarrage. Pour le fichier, ajouter au service `relay` du compose :
+
+```yaml
+    volumes:
+      - ./deploy/operator-config:/etc/noctis:ro
+```
+
+puis `NOCTIS_DENY_FILE=/etc/noctis/deny.txt` dans `.env` (une entrée par ligne,
+`#` pour commenter ; créer `deploy/operator-config/deny.txt` avant le
+démarrage). Le dossier est monté pour que le remplacement du fichier par un
+éditeur reste visible dans le conteneur.
+Après modification : `docker compose kill -s HUP relay`. Un fichier invalide
+est refusé et l'ancienne liste reste active ; le journal indique seulement le
+nombre de réseaux chargés ou le numéro de ligne fautif, jamais les adresses.
+Un pair direct bloqué est coupé sans réponse ; un client bloqué derrière Caddy
+reçoit `403 forbidden`. Il n'existe aucune API d'administration.
+
+**Ce que le relais ne fait pas.** Ces limites protègent le processus et les
+sessions existantes contre un client ou un petit groupe malveillant ; elles ne
+constituent **pas** une protection DDoS réseau. Un attaquant disposant de
+nombreux réseaux peut épuiser les budgets globaux de création (les nouvelles
+sessions reçoivent alors `503`) ou saturer la bande passante du VPS. Le
+filtrage volumétrique relève de l'hébergeur (anti-DDoS OVH, pare-feu réseau)
+ou d'un service en amont.
+
+**Caddy (recommandation non validée ici).** Pour couper plus tôt les
+connexions lentes côté Caddy, on peut placer en tête de
+`deploy/Caddyfile` un bloc d'options global
+`{ servers { timeouts { read_header 5s read_body 10s idle 60s } } }`. Ce réglage n'a pas été testé avec ce dépôt ; le relais applique
+de toute façon ses propres délais et limites par client réel.
 
 ### Exploitation
 
 - Mise à jour : `git pull && docker compose --profile https up -d --build`.
   Le redémarrage efface les sessions : les clients en recréent une.
-- Journaux : `docker compose logs relay` (démarrage, erreurs internes ; ni IP
-  ni jeton). Journaux Docker limités à 3 × 1 Mio.
+- Journaux : `docker compose logs relay` (démarrage, erreurs internes,
+  rechargement de la liste de blocage ; ni IP ni jeton). Journaux Docker
+  limités à 3 × 1 Mio.
 - L'hébergeur et le système peuvent conserver leurs propres journaux réseau ;
   l'opérateur reste responsable de son information des joueurs et de ses
   obligations légales.
@@ -70,8 +122,9 @@ curl http://<VPS_IP>:8787/healthz
 Open port 8787 in the VPS firewall (and in the OVH network firewall if
 enabled), close it after the test and set `NOCTIS_PUBLISH=127.0.0.1` again.
 Docker publishes ports ahead of `ufw` rules: `NOCTIS_PUBLISH` is what actually
-controls exposure. In the game, use `http://<VPS_IP>:8787` as relay address and
-explicitly allow "Remote HTTP" for this test.
+controls exposure. In `config/astralyth-noctis-client.toml`, set
+`relayUrl = "http://<VPS_IP>:8787"` and `allowInsecureHttp = true` for this
+test. Neither setting is editable in game.
 
 ### 2. HTTPS with a domain
 
@@ -84,15 +137,91 @@ explicitly allow "Remote HTTP" for this test.
 Caddy obtains and renews the certificate, writes no access log and replaces
 any incoming `X-Forwarded-For` with the real peer address; the relay trusts
 that header only from the Caddy container. Known limit: the compose network
-is IPv4; depending on the Docker setup, IPv6 clients may appear as the Docker
-gateway and share one rate-limit bucket. Enable IPv6 in Docker or run Caddy on
-the host if IPv6 matters.
+is IPv4.
+
+**IPv6, check before opening the service.** Depending on the Docker setup
+(`userland-proxy`), IPv6 clients may appear as the Docker gateway. They would
+then share a single "network": one rate budget and, above all, at most
+`NOCTIS_MAX_SESSIONS_PER_NETWORK` (16) live sessions for every IPv6 player.
+Fixes: enable IPv6 in Docker, run Caddy on the host, or do not publish an
+`AAAA` record. Check: with a temporary `NOCTIS_MAX_SESSIONS_PER_NETWORK=1`,
+open sessions from two different IPv6 accesses and verify the second one is
+accepted.
+
+### Abuse limits
+
+Defaults (see `.env.example` and *Errors and limits* in
+[PROTOCOL.md](PROTOCOL.md#errors-and-limits)) target a community relay: 16 live
+sessions per network (IPv4 or IPv6 /64), relay-wide budgets of 2 000 requests,
+50 creations and 1 000 presence updates per second, 32 sockets per direct peer,
+8 in-progress requests per real client. Behind a campus NAT or CGNAT, raise
+`NOCTIS_MAX_SESSIONS_PER_NETWORK`, `NOCTIS_REQUEST_RATE` and
+`NOCTIS_CREATE_RATE`. Setting a limit to `0` disables it. `429`/`503` answers
+carry `Retry-After`.
+
+**Operator blocking.** `NOCTIS_DENY_NETWORKS` (addresses or CIDRs) in `.env`,
+applied at restart, or a file reloadable without restart. For the file, add to
+the compose `relay` service:
+
+```yaml
+    volumes:
+      - ./deploy/operator-config:/etc/noctis:ro
+```
+
+then `NOCTIS_DENY_FILE=/etc/noctis/deny.txt` in `.env` (one entry per line,
+`#` for comments; create `deploy/operator-config/deny.txt` before startup).
+Mount the directory so replacing the file with an editor remains visible
+inside the container. After editing
+it: `docker compose kill -s HUP relay`. An invalid file is rejected and the
+previous list stays active; the log only shows how many networks were loaded
+or the faulty line number, never addresses. A blocked direct peer is dropped
+without an answer; a blocked client behind Caddy gets `403 forbidden`. There is
+no administration API.
+
+**What the relay does not do.** These limits protect the process and existing
+sessions against one malicious client or a small group; they are **not**
+network-level DDoS protection. An attacker with many networks can exhaust the
+relay-wide creation budget (new sessions then get `503`) or saturate the VPS
+bandwidth. Volumetric filtering belongs to the host (OVH anti-DDoS, network
+firewall) or an upstream service.
+
+**Caddy (recommendation, not validated here).** To drop slow connections
+earlier at Caddy, a global options block can be put at the top of
+`deploy/Caddyfile`: `{ servers { timeouts { read_header 5s read_body 10s idle 60s } } }`. This setting
+was not tested with this repository; the relay applies its own deadlines and
+per-real-client limits regardless.
 
 ### Operations
 
 - Update: `git pull && docker compose --profile https up -d --build`. A restart
   drops all sessions; clients simply create new ones.
-- Logs: `docker compose logs relay` (startup and internal errors; no IPs or
-  tokens). Docker logs are capped at 3 × 1 MiB.
+- Logs: `docker compose logs relay` (startup, internal errors, block-list
+  reloads; no IPs or tokens). Docker logs are capped at 3 × 1 MiB.
 - The host and OS may keep their own network logs; the operator remains
   responsible for informing players and for legal obligations.
+
+## Existing Traefik / Coolify proxy
+
+When ports 80/443 already belong to Traefik, use
+[deploy/compose.traefik.yaml](deploy/compose.traefik.yaml) rather than starting
+a second HTTPS proxy. This template is based on the official OVH deployment.
+It does not reconfigure or restart the existing proxy.
+
+1. Fill `.env` with the operator and `NOCTIS_TRUSTED_PROXIES` set to the
+   **exact address/CIDR** of the proxy on the chosen Docker network. Set
+   `NOCTIS_PROXY_NETWORK` if its name differs from `proxy-network`.
+2. Create `deploy/config/deny-networks.txt` from
+   [the empty example](deploy/deny-networks.example.txt). Keep actual block
+   rules out of Git.
+3. `docker compose --env-file .env -f deploy/compose.traefik.yaml up -d --build`
+4. Adapt [traefik.dynamic.example.yaml](deploy/traefik.dynamic.example.yaml):
+   domain, entrypoint names, certificate resolver and backend container name.
+   Install this **new** file in the proxy’s watched dynamic directory.
+5. Verify `/healthz` and `/v1/info` with certificate verification enabled, then
+   set `relayUrl` in the client configuration.
+
+The template binds the application port to loopback, caps the relay at one
+CPU/256 MiB, and mounts the block-list directory read-only. HTTP redirects to
+HTTPS; the existing proxy obtains and renews the certificate. Check its logging
+policy and real-client forwarding before public use. The official service uses
+`NOCTIS_SESSION_BINDING=strict` and leaves presence disabled.

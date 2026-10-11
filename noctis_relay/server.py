@@ -21,9 +21,9 @@ from dataclasses import dataclass
 from typing import Callable
 
 from . import PRIVACY_REVISION, PROTOCOL, __version__
-from .config import Config, ConfigError, load_config
-from .ratelimit import TokenBuckets, client_key
-from .store import CapacityError, Session, Store
+from .config import Config, ConfigError, load_config, load_deny_file
+from .ratelimit import Bucket, Concurrency, Fingerprints, NetworkSet, TokenBuckets, client_key, prefix_key
+from .store import AreaFullError, CapacityError, Session, Store
 
 log = logging.getLogger("noctis_relay")
 
@@ -31,6 +31,10 @@ TOKEN_RE = re.compile(r"[0-9a-f]{64}")
 REALM_RE = re.compile(r"[a-z0-9_.-]{1,32}:[a-z0-9_./-]{1,64}")
 OPAQUE_RE = re.compile(r"[A-Za-z0-9_-]+")
 METHOD_RE = re.compile(r"[A-Z]{1,10}")
+# RFC 9110 field-name token and request-target without controls or spaces.
+HEADER_NAME_RE = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+TARGET_RE = re.compile(r"/[\x21-\x7e]*")
+HEADER_VALUE_BAD_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 MAX_HEADERS = 32
 MAX_HEAD_BYTES = 8192
 MAX_HORIZONTAL = 30_000_000
@@ -61,7 +65,9 @@ class Request:
     path: str
     headers: dict[str, str]
     body: bytes
-    client: str
+    # Keyed fingerprints of the client network and of its wider prefix.
+    client: bytes
+    prefix: bytes = b""
 
 
 @dataclass
@@ -117,10 +123,10 @@ def _number(obj: dict, key: str, lo: float, hi: float) -> float:
     # bool is a subclass of int in Python: reject it explicitly.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise HttpError(400, "invalid_" + key)
-    value = float(value)
-    if not math.isfinite(value) or not lo <= value <= hi:
+    # Compare before converting: float() of a huge JSON integer overflows.
+    if isinstance(value, float) and not math.isfinite(value) or not lo <= value <= hi:
         raise HttpError(400, "invalid_" + key)
-    return value
+    return float(value)
 
 
 def _string(obj: dict, key: str, pattern: re.Pattern, lo: int, hi: int) -> str:
@@ -154,9 +160,23 @@ class Relay:
             near_vertical=config.near_vertical,
             near_limit=config.near_limit,
             clock=clock,
+            max_per_cell=config.presence_max_per_cell,
         )
-        self.requests = TokenBuckets(config.request_rate, config.request_burst, config.rate_table_size, clock)
-        self.creates = TokenBuckets(config.create_rate, config.create_burst, config.rate_table_size, clock)
+        self.fingerprints = Fingerprints()
+        size = config.rate_table_size
+        self.requests = TokenBuckets(config.request_rate, config.request_burst, size, clock)
+        self.creates = TokenBuckets(config.create_rate, config.create_burst, size, clock)
+        self.prefix_creates = (
+            TokenBuckets(config.create_prefix_rate, config.create_prefix_burst, size, clock)
+            if config.create_prefix_rate else None
+        )
+        self.session_requests = (
+            TokenBuckets(config.session_request_rate, config.session_request_burst, config.max_sessions, clock)
+            if config.session_request_rate else None
+        )
+        self.global_requests = _bucket(config.global_request_rate, config.global_request_burst, clock)
+        self.global_creates = _bucket(config.global_create_rate, config.global_create_burst, clock)
+        self.global_presence = _bucket(config.global_presence_rate, config.global_presence_burst, clock)
         caps = ["sessions"] + (["presence"] if config.presence_enabled else [])
         self.info = {
             "protocol": PROTOCOL,
@@ -183,10 +203,36 @@ class Relay:
         if config.presence_enabled:
             self.routes["/v1/presence"] = {"PUT": self.put_presence, "DELETE": self.delete_presence}
 
-    def handle(self, req: Request) -> Response:
-        wait = self.requests.take(req.client)
+    def admit(self, client: bytes, headers: dict[str, str]) -> None:
+        """Request budget, checked from the headers before the body is read.
+
+        The per-client bucket comes first so that a throttled client cannot
+        drain the relay-wide budget. A request bearing a live session token
+        is then charged to that session (one indexed lookup); only the
+        others (session creation, info, unknown tokens) share the relay-wide
+        budget, so rotating addresses cannot starve existing sessions.
+        """
+        wait = self.requests.take(client)
         if wait:
             raise _too_many(wait)
+        scheme, _, token = headers.get("authorization", "").partition(" ")
+        session = (
+            self.store.find_session(token)
+            if scheme.lower() == "bearer" and TOKEN_RE.fullmatch(token) else None
+        )
+        # A replay from another network in strict mode must not spend the
+        # legitimate holder's session budget. It is anonymous traffic for
+        # admission; the route still rejects it (or permits token revocation).
+        if session is None or (
+            self.config.session_binding == "strict" and session.net != client
+        ):
+            _spend(self.global_requests)
+        elif self.session_requests is not None:
+            wait = self.session_requests.take(session.sid)
+            if wait:
+                raise _too_many(wait)
+
+    def handle(self, req: Request) -> Response:
         methods = self.routes.get(req.path)
         if methods is None:
             raise HttpError(404, "not_found")
@@ -207,12 +253,31 @@ class Relay:
             raise HttpError(401, "invalid_token", {"WWW-Authenticate": "Bearer"})
         return token
 
-    def _session(self, req: Request) -> tuple[str, Session]:
-        token = self._token(req)
-        session = self.store.find_session(token)
+    def _session(self, req: Request) -> Session:
+        session = self.store.find_session(self._token(req))
         if session is None:
-            raise HttpError(401, "session_expired", {"WWW-Authenticate": 'Bearer error="invalid_token"'})
-        return token, session
+            raise _expired()
+        return session
+
+    def _check_network(self, req: Request, session: Session) -> None:
+        """Refuse, before any change, a session used from another network.
+
+        In ``migrate`` mode the session may follow its holder (Wi-Fi to
+        mobile, new DHCP lease) if the new network still has room under its
+        live-session cap: a token handed to someone else therefore counts
+        against the network that actually uses it. ``strict`` mode answers
+        as for an expired session and the client opens a new one.
+        """
+        if session.net == req.client:
+            return
+        if self.config.session_binding == "strict":
+            raise _expired()
+        self._check_network_room(req.client)
+
+    def _check_network_room(self, net: bytes) -> None:
+        cap = self.config.max_sessions_per_network
+        if cap and self.store.network_sessions(net) >= cap:
+            raise HttpError(429, "too_many_sessions", {"Retry-After": str(self.config.retention_seconds)})
 
     def healthz(self, req: Request) -> Response:
         return Response(200, {"status": "ok"})
@@ -238,13 +303,26 @@ class Relay:
                 if cap not in KNOWN_CAPABILITIES or not self.config.presence_enabled:
                     raise HttpError(400, "capability_unavailable")
             presence = "presence" in caps
-        wait = self.creates.take(req.client)
-        if wait:
-            raise _too_many(wait)
+        # Every refusal below gives the creation tokens back: no session was
+        # opened, and a relay-wide shortage must not burn a client's budget.
+        taken = []
         try:
-            token, _ = self.store.create_session(presence=presence)
-        except CapacityError:
-            raise HttpError(503, "capacity", {"Retry-After": str(self.config.retention_seconds)}) from None
+            for buckets, key in ((self.creates, req.client), (self.prefix_creates, req.prefix)):
+                if buckets is not None:
+                    wait = buckets.take(key)
+                    if wait:
+                        raise _too_many(wait)
+                    taken.append((buckets, key))
+            self._check_network_room(req.client)
+            _spend(self.global_creates)
+            try:
+                token, _ = self.store.create_session(presence=presence, net=req.client)
+            except CapacityError:
+                raise HttpError(503, "capacity", {"Retry-After": str(self.config.retention_seconds)}) from None
+        except HttpError:
+            for buckets, key in taken:
+                buckets.refund(key)
+            raise
         body = {"protocol": PROTOCOL, "token": token, **self._session_ttl()}
         if presence:
             body["capabilities"] = ["presence"]
@@ -254,16 +332,22 @@ class Relay:
         token = self._token(req)
         obj = parse_json_object(req)
         _only_keys(obj, set())
-        if self.store.refresh_session(token) is None:
-            raise HttpError(401, "session_expired", {"WWW-Authenticate": 'Bearer error="invalid_token"'})
+        session = self.store.find_session(token)
+        if session is None:
+            raise _expired()
+        self._check_network(req, session)
+        if self.store.refresh_session(session, req.client) is None:
+            raise _expired()
         return Response(200, {"protocol": PROTOCOL, **self._session_ttl()})
 
     def delete_session(self, req: Request) -> Response:
+        # Holding the token is enough to revoke it, from any network: this
+        # frees the quota immediately (client disconnect, network change).
         self.store.delete_session(self._token(req))
         return Response(204)
 
     def _presence_session(self, req: Request) -> Session:
-        _, session = self._session(req)
+        session = self._session(req)
         if not session.presence:
             raise HttpError(403, "capability_not_granted")
         return session
@@ -278,10 +362,15 @@ class Relay:
         x = _number(obj, "x", -MAX_HORIZONTAL, MAX_HORIZONTAL)
         y = _number(obj, "y", MIN_Y, MAX_Y)
         z = _number(obj, "z", -MAX_HORIZONTAL, MAX_HORIZONTAL)
+        self._check_network(req, session)
         since = self.clock() - session.last_presence
         if since < self.config.presence_min_interval:
             raise _too_many(self.config.presence_min_interval - since)
-        _, nearby = self.store.update_presence(session, realm, profile, instance, x, y, z)
+        _spend(self.global_presence)
+        try:
+            _, nearby = self.store.update_presence(session, realm, profile, instance, x, y, z, req.client)
+        except AreaFullError:
+            raise HttpError(503, "area_full", {"Retry-After": str(self.config.retention_seconds)}) from None
         return Response(200, {
             "expiresInSeconds": self.config.retention_seconds,
             "nearby": [
@@ -292,6 +381,7 @@ class Relay:
         })
 
     def delete_presence(self, req: Request) -> Response:
+        # Like DELETE /v1/session, withdrawing a position is always allowed.
         self.store.clear_presence(self._presence_session(req))
         return Response(204)
 
@@ -299,27 +389,52 @@ class Relay:
         self.store.purge(limit=self.config.purge_batch)
 
 
+def _retry_after(wait: float) -> dict:
+    return {"Retry-After": str(max(1, math.ceil(wait)))}
+
+
 def _too_many(wait: float) -> HttpError:
-    return HttpError(429, "rate_limited", {"Retry-After": str(max(1, math.ceil(wait)))})
+    return HttpError(429, "rate_limited", _retry_after(wait))
+
+
+def _expired() -> HttpError:
+    return HttpError(401, "session_expired", {"WWW-Authenticate": 'Bearer error="invalid_token"'})
+
+
+def _bucket(rate: float, burst: int, clock) -> Bucket | None:
+    return Bucket(rate, burst, clock) if rate > 0 else None
+
+
+def _spend(bucket: Bucket | None) -> None:
+    """Take one unit from a relay-wide budget; 503 when it is exhausted."""
+    if bucket is not None:
+        wait = bucket.take()
+        if wait:
+            raise HttpError(503, "overloaded", _retry_after(wait))
 
 
 # -- HTTP transport ------------------------------------------------------------
 
 
-def _resolve_client(config: Config, peer: str, headers: dict[str, str]) -> str:
-    if config.trust_proxy and "x-forwarded-for" in headers:
-        try:
-            peer_ip = ipaddress.ip_address(peer)
-        except ValueError:
-            return client_key(peer)
-        if any(peer_ip in net for net in config.trusted_proxies):
+def _peer_address(peer: str):
+    try:
+        return ipaddress.ip_address(peer)
+    except ValueError:
+        return None
+
+
+def _resolve_client(config: Config, peer: str, headers: dict[str, str], proxies: NetworkSet | None = None):
+    """Real client address: the peer, or X-Forwarded-For from a trusted proxy."""
+    peer_ip = _peer_address(peer)
+    if config.trust_proxy and peer_ip is not None and "x-forwarded-for" in headers:
+        proxies = NetworkSet(config.trusted_proxies) if proxies is None else proxies
+        if peer_ip in proxies:
             # Only the right-most hop was written by our own proxy.
             candidate = headers["x-forwarded-for"].rsplit(",", 1)[-1].strip()
-            try:
-                return client_key(str(ipaddress.ip_address(candidate)))
-            except ValueError:
-                pass
-    return client_key(peer)
+            addr = _peer_address(candidate)
+            if addr is not None:
+                return addr
+    return peer_ip
 
 
 def _parse_head(raw: bytes) -> tuple[str, str, str, dict[str, str]]:
@@ -332,18 +447,18 @@ def _parse_head(raw: bytes) -> tuple[str, str, str, dict[str, str]]:
     if len(parts) != 3 or not METHOD_RE.fullmatch(parts[0]) or parts[2] not in ("HTTP/1.1", "HTTP/1.0"):
         raise HttpError(400, "bad_request", close=True)
     method, target, version = parts
-    if not target.startswith("/") or len(target) > 256:
+    if len(target) > 256 or not TARGET_RE.fullmatch(target):
         raise HttpError(400, "bad_request", close=True)
     if len(lines) - 1 > MAX_HEADERS:
         raise HttpError(431, "headers_too_large", close=True)
     headers: dict[str, str] = {}
     for line in lines[1:]:
         name, sep, value = line.partition(":")
-        if not sep or not name or name != name.strip() or any(c in name for c in " \t"):
+        if not sep or not HEADER_NAME_RE.fullmatch(name):
             raise HttpError(400, "bad_request", close=True)
         name = name.lower()
         value = value.strip(" \t")
-        if any(ord(c) < 32 and c != "\t" for c in value):
+        if HEADER_VALUE_BAD_RE.search(value):
             raise HttpError(400, "bad_request", close=True)
         if name in headers:
             if name in ("content-length", "authorization", "content-type", "host"):
@@ -383,8 +498,25 @@ class HttpServer:
         self.config = relay.config
         self.active = 0
         self.errors = 0
+        self.proxies = NetworkSet(self.config.trusted_proxies if self.config.trust_proxy else ())
+        self.deny = self._build_deny()
+        # Keys are network fingerprints; entries vanish when released.
+        self.peer_sockets = Concurrency(self.config.max_connections_per_peer)
+        self.inflight = Concurrency(self.config.max_inflight_per_client)
         self._server: asyncio.base_events.Server | None = None
         self._purger: asyncio.Task | None = None
+
+    def _build_deny(self) -> NetworkSet:
+        return NetworkSet([*self.config.deny_networks, *load_deny_file(self.config.deny_file)])
+
+    def reload_deny(self) -> None:
+        """Re-read NOCTIS_DENY_FILE (SIGHUP); keep the old list on error."""
+        try:
+            self.deny = self._build_deny()
+        except ConfigError as exc:
+            log.error("deny list not reloaded: %s", exc)
+            return
+        log.info("deny list reloaded: %d networks", len(self.deny))
 
     async def start(self, host: str | None = None, port: int | None = None) -> int:
         self._server = await asyncio.start_server(
@@ -414,13 +546,21 @@ class HttpServer:
                 _log_internal("purge", exc)
 
     async def _connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        if self.active >= self.config.max_connections:
+        peer = writer.get_extra_info("peername")
+        peer_ip = peer[0] if peer else "?"
+        addr = _peer_address(peer_ip)
+        # Refused sockets are reset at once, without reading or answering.
+        if self.active >= self.config.max_connections or addr in self.deny:
+            writer.transport.abort()
+            return
+        # A trusted proxy multiplexes many players: only the global cap
+        # applies to it; its clients are limited per request below.
+        slot = None if addr in self.proxies else self.relay.fingerprints.tag(client_key(addr))
+        if slot is not None and not self.peer_sockets.acquire(slot):
             writer.transport.abort()
             return
         self.active += 1
         try:
-            peer = writer.get_extra_info("peername")
-            peer_ip = peer[0] if peer else "?"
             for index in range(self.config.max_requests_per_connection):
                 if not await self._one_request(reader, writer, peer_ip, index):
                     break
@@ -428,6 +568,8 @@ class HttpServer:
             pass
         finally:
             self.active -= 1
+            if slot is not None:
+                self.peer_sockets.release(slot)
             writer.close()
 
     async def _send(self, writer, status, body, headers, keep_alive) -> None:
@@ -444,6 +586,7 @@ class HttpServer:
             return False
         except (asyncio.IncompleteReadError, asyncio.TimeoutError):
             return False
+        pending = 0  # body bytes announced but not read: the stream is unusable
         try:
             method, path, version, headers = _parse_head(raw)
             if "transfer-encoding" in headers:
@@ -458,22 +601,35 @@ class HttpServer:
                 raise HttpError(413, "body_too_large", close=True)
             if method in ("POST", "PUT") and "content-length" not in headers:
                 raise HttpError(411, "length_required", close=True)
-            body = await asyncio.wait_for(reader.readexactly(length), cfg.body_timeout) if length else b""
-            keep_alive = version == "HTTP/1.1" and headers.get("connection", "").lower() != "close"
-            keep_alive = keep_alive and index + 1 < cfg.max_requests_per_connection
-            req = Request(method, path, headers, body, _resolve_client(cfg, peer_ip, headers))
+            pending = length
+            addr = _resolve_client(cfg, peer_ip, headers, self.proxies)
+            if addr in self.deny:
+                raise HttpError(403, "forbidden", close=True)
+            fingerprints = self.relay.fingerprints
+            client = fingerprints.tag(client_key(addr))
+            if not self.inflight.acquire(client):
+                raise HttpError(429, "concurrency_limited", {"Retry-After": "1"}, close=True)
             try:
-                resp = self.relay.handle(req)
-            except HttpError:
-                raise
-            except Exception as exc:
-                self.errors += 1
-                _log_internal("request", exc)
-                raise HttpError(500, "internal", close=True) from None
+                self.relay.admit(client, headers)
+                body = await asyncio.wait_for(reader.readexactly(length), cfg.body_timeout) if length else b""
+                pending = 0
+                keep_alive = version == "HTTP/1.1" and headers.get("connection", "").lower() != "close"
+                keep_alive = keep_alive and index + 1 < cfg.max_requests_per_connection
+                req = Request(method, path, headers, body, client, fingerprints.tag(prefix_key(addr)))
+                try:
+                    resp = self.relay.handle(req)
+                except HttpError:
+                    raise
+                except Exception as exc:
+                    self.errors += 1
+                    _log_internal("request", exc)
+                    raise HttpError(500, "internal", close=True) from None
+            finally:
+                self.inflight.release(client)
             await self._send(writer, resp.status, resp.body, resp.headers, keep_alive)
             return keep_alive
         except HttpError as err:
-            keep_alive = not err.close and index + 1 < cfg.max_requests_per_connection
+            keep_alive = not err.close and not pending and index + 1 < cfg.max_requests_per_connection
             await self._send(writer, err.status, {"error": err.code}, err.headers, keep_alive)
             return keep_alive
 
@@ -490,6 +646,11 @@ async def serve(config: Config) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:  # pragma: no cover - non-POSIX
+            pass
+    if hasattr(signal, "SIGHUP"):
+        try:
+            loop.add_signal_handler(signal.SIGHUP, server.reload_deny)
         except NotImplementedError:  # pragma: no cover - non-POSIX
             pass
     await stop.wait()
