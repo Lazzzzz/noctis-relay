@@ -139,7 +139,8 @@ class GearTest(unittest.TestCase):
         self.assertRefused(gear(pose=[[0, 4, 0]]))  # off hand use without use
         self.assertRefused(gear(pose=[[0, 64, 0]]))
         self.assertRefused(gear(pose=[[0, 1, 101]]))
-        self.assertRefused(gear(pose=[[i, i % 2 + 1, 0] for i in range(65)]), end=120)
+        self.assertRefused(gear(pose=[[i, i % 2 + 1, 0] for i in range(equipment.MAX_POSE_ENTRIES + 1)]),
+                           end=equipment.MAX_TICK)
 
     def test_item_root_and_keys(self):
         named = bytes([10]) + utf("x") + compound(id=string("minecraft:elytra"), count=integer(1))[1]
@@ -228,23 +229,40 @@ class GearTest(unittest.TestCase):
     def test_size_budgets(self):
         big = item(components=[("mod:pad", (7, struct.pack(">i", 250) + b"x" * 250)) for _ in range(1)])
         parse_item(big)
-        huge = item(components=[(f"mod:pad{i}", (7, struct.pack(">i", 250) + b"x" * 250)) for i in range(9)])
+        huge = item(components=[(f"mod:pad{i}", (7, struct.pack(">i", 250) + b"x" * 250)) for i in range(33)])
+        self.assertGreater(len(huge), equipment.MAX_ITEM_BYTES)
         with self.assertRaises(GearError):
             parse_item(huge)
-        stacks = [item(f"mod:i{i}", components=[(f"mod:pad{j}", (7, struct.pack(">i", 240) + b"x" * 240)) for j in range(6)]) for i in range(5)]
+        stacks = [item(f"mod:i{i}", components=[(f"mod:pad{j}", (7, struct.pack(">i", 250) + b"x" * 250)) for j in range(30)]) for i in range(13)]
         self.assertTrue(all(len(s) <= equipment.MAX_ITEM_BYTES for s in stacks))
         self.assertGreater(sum(map(len, stacks)), equipment.MAX_ITEMS_BYTES)
-        slots = [[0, f"mod:s{i}", i] for i in range(5)]
+        slots = [[0, f"mod:s{i}", i] for i in range(13)]
         self.assertRefused({"items": [b64(s) for s in stacks], "slots": slots, "pose": []})
 
     def test_worst_case_fits_upload(self):
         """Largest accepted gear stays under the canonical JSON cap."""
-        stacks = [item(f"mod:i{i}", components=[(f"mod:p{j}", (7, struct.pack(">i", 240) + b"x" * 240)) for j in range(1)]) for i in range(12)]
-        slots = [[i // 4 * 10, f"slot{i % 12:02d}-name-padding-x:{'p' * 30}", i % 12] for i in range(12)]
-        slots += [[100 + i, f"slot{i % 12:02d}-name-padding-x:{'p' * 30}", -1] for i in range(12)]
-        pose = [[i, 1 + i % 2, i % 101] for i in range(64)]
-        parsed = parse_gear({"items": [b64(s) for s in stacks], "slots": slots, "pose": pose}, 120)
+        parsed = parse_gear(maximal_gear(), equipment.MAX_TICK)
         self.assertLessEqual(len(canonical_json(parsed)), equipment.MAX_GEAR_JSON)
+
+
+def maximal_gear():
+    """Every budget at its limit: item bytes, slot entries with the longest names, a pose per tick."""
+    per = equipment.MAX_ITEMS_BYTES // equipment.MAX_ITEMS
+    stacks = []
+    for i in range(equipment.MAX_ITEMS):
+        pads = [150] * 8  # NBT arrays are at most 256 long: fill the item with several
+        size = len(item(f"mod:i{i:02d}", components=[(f"mod:p{j}", (7, struct.pack(">i", n) + b"x" * n)) for j, n in enumerate(pads)]))
+        for j in range(per - size):
+            pads[j % len(pads)] += 1
+        stacks.append(item(f"mod:i{i:02d}", components=[(f"mod:p{j}", (7, struct.pack(">i", n) + b"x" * n)) for j, n in enumerate(pads)]))
+        assert len(stacks[-1]) == per
+    assert sum(map(len, stacks)) <= equipment.MAX_ITEMS_BYTES
+    names = [f"{'n' * 21}{i:03d}:{'p' * 32}" for i in range(equipment.MAX_SLOT_NAMES)]
+    slots = [[0, names[i], i] for i in range(equipment.MAX_SLOT_NAMES)]
+    slots += [[1 + i, names[i % equipment.MAX_SLOT_NAMES], (equipment.MAX_SLOT_NAMES + i) % equipment.MAX_ITEMS]
+              for i in range(equipment.MAX_SLOT_ENTRIES - equipment.MAX_SLOT_NAMES)]
+    pose = [[i, 1 + i % 2, i % 101] for i in range(equipment.MAX_POSE_ENTRIES)]
+    return {"items": [b64(s) for s in stacks], "slots": slots, "pose": pose}
 
 
 if __name__ == "__main__":

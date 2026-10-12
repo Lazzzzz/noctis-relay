@@ -1,6 +1,6 @@
 [project]
 name = "noctis-relay"
-version = "0.5.0"
+version = "0.6.0"
 description = "Self-hostable relay for Noctis: ephemeral opt-in sessions, optional proximity presence, echoes and their durable archive."
 readme = "README.md"
 license = { text = "MIT" }

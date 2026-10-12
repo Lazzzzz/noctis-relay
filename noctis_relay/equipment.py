@@ -23,14 +23,16 @@ import re
 import struct
 
 VERSION = 1
-MAX_ITEMS = 12
-MAX_ITEM_BYTES = 2048
-MAX_ITEMS_BYTES = 6144
-MAX_GEAR_JSON = 10240
-MAX_SLOT_ENTRIES = 48
+# Generous enough that a real minute of play is never shortened: every swap
+# of every slot, a pose change per tick, rich modded items.
+MAX_ITEMS = 64
+MAX_ITEM_BYTES = 8192
+MAX_ITEMS_BYTES = 98_304
+MAX_GEAR_JSON = 262_144
+MAX_SLOT_ENTRIES = 1024
 MAX_SLOT_NAMES = 16
-MAX_POSE_ENTRIES = 64
-MAX_TICK = 120
+MAX_TICK = 1200
+MAX_POSE_ENTRIES = MAX_TICK + 1
 POSE_BITS = 0b111111  # fall flying, using, using off hand, swing off hand, left handed, spin attack
 POSE_USING, POSE_USE_OFFHAND = 2, 4
 MAX_POWER = 100

@@ -1,7 +1,8 @@
 import json
 import unittest
 
-from noctis_relay.store import Store
+from noctis_relay.server import CLIP_ACTION_RANGE, CLIP_MAX_ACTIONS, CLIP_MAX_FRAMES, CLIP_MAX_OFFSET, CLIP_MAX_TICKS
+from noctis_relay.store import LiveFullError, Store
 
 from .support import RunningRelay, make_config
 
@@ -22,6 +23,19 @@ def walk(n=6, step=8, flags=1):
 def clip(instance="inst-aaaaaaaaaaaa", frames=None, **extra):
     body = {**place(instance=instance), "account": ACCOUNT, "frames": frames or walk()}
     body.update(extra)
+    return body
+
+
+def maximal_clip(**extra):
+    """The largest clip the relay accepts: a full minute, every tick, every action, longest names."""
+    step = 109  # 3.4 blocks a tick on each axis, below the speed cap, wide offsets
+    frames = [[t, -step * t, -step * t, -step * t, 255, -64, 255, 31] for t in range(CLIP_MAX_FRAMES)]
+    name = "abcdefghijklmnopqrstuvwxyz012345:" + "p" * 64
+    actions = [[t, 1 + t % 2, round(frames[t][1] / 32) - 6, round(frames[t][2] / 32), round(frames[t][3] / 32), name]
+               for t in range(CLIP_MAX_ACTIONS)]
+    body = clip(frames=frames, actions=actions, chat=[[2, "\U0001F600" * 64], [4, "ü" * 64]], **extra)
+    body.update(realm="abcdefghijklmnopqrstuvwxyz012345:" + "p" * 64, profile="p" * 64, instance="i" * 64,
+                x=-29999999.123456789, y=2047.123456789, z=-29999999.123456789)
     return body
 
 
@@ -193,15 +207,15 @@ class EchoApiTest(unittest.TestCase):
             "one frame": [[0, 0, 0, 0, 0, 0, 0, 0]],
             "not starting at origin": [[0, 1, 0, 0, 0, 0, 0, 0], [2, 2, 0, 0, 0, 0, 0, 0]],
             "time not increasing": [[0, 0, 0, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0, 0, 0]],
-            "too long": [[0, 0, 0, 0, 0, 0, 0, 0], [121, 0, 0, 0, 0, 0, 0, 0]],
+            "too long": [[0, 0, 0, 0, 0, 0, 0, 0], [CLIP_MAX_TICKS + 1, 0, 0, 0, 0, 0, 0, 0]],
             "float": [[0, 0, 0, 0, 0, 0, 0, 0], [2, 1.5, 0, 0, 0, 0, 0, 0]],
             "bool": [[0, 0, 0, 0, 0, 0, 0, 0], [2, True, 0, 0, 0, 0, 0, 0]],
             "yaw": [[0, 0, 0, 0, 256, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0]],
             "pitch": [[0, 0, 0, 0, 0, 65, 0, 0], [2, 0, 0, 0, 0, 0, 0, 0]],
             "flags": [[0, 0, 0, 0, 0, 0, 0, 32], [2, 0, 0, 0, 0, 0, 0, 0]],
             "short": [[0, 0, 0, 0, 0, 0, 0], [2, 0, 0, 0, 0, 0, 0]],
-            "offset": [[0, 0, 0, 0, 0, 0, 0, 0], [120, 1537, 0, 0, 0, 0, 0, 0]],
-            "too many": [[i, 0, 0, 0, 0, 0, 0, 0] for i in range(61)],
+            "offset": [[0, 0, 0, 0, 0, 0, 0, 0], [CLIP_MAX_TICKS, CLIP_MAX_OFFSET + 1, 0, 0, 0, 0, 0, 0]],
+            "too many": [[i, 0, 0, 0, 0, 0, 0, 0] for i in range(CLIP_MAX_FRAMES + 1)],
             "string": [[0, 0, 0, 0, 0, 0, 0, 0], [2, "1", 0, 0, 0, 0, 0, 0]],
         }
         for name, frames in cases.items():
@@ -209,10 +223,14 @@ class EchoApiTest(unittest.TestCase):
             self.assertEqual((status, body["error"]), (400, "invalid_frames"), name)
         # Teleport and fly-hacks.
         for frames in (
-            [[0, 0, 0, 0, 0, 0, 0, 0], [1, 64, 0, 0, 0, 0, 0, 0]],       # 2 blocks in one tick
-            [[0, 0, 0, 0, 0, 0, 0, 0], [1, 0, 160, 0, 0, 0, 0, 0]],      # 5 blocks up in one tick
+            [[0, 0, 0, 0, 0, 0, 0, 0], [1, 352, 0, 0, 0, 0, 0, 0]],      # 11 blocks in one tick
+            [[0, 0, 0, 0, 0, 0, 0, 0], [1, 0, 352, 0, 0, 0, 0, 0]],      # 11 blocks up in one tick
         ):
             self.assertEqual(self.publish(a, clip(frames=frames))[1]["error"], "implausible_movement")
+        # An elytra dive or a jetpack burst is real movement, not a teleport.
+        self.r.clock.advance(2)
+        fast = [[0, 0, 0, 0, 0, 0, 0, 0], [1, 300, -100, 0, 0, 0, 0, 0], [2, 600, -200, 0, 0, 0, 0, 0]]
+        self.assertEqual(self.publish(a, clip(frames=fast))[0], 200)
 
     def test_action_validation(self):
         a = self.session()
@@ -226,7 +244,8 @@ class EchoApiTest(unittest.TestCase):
             ([[2, 1, 0, 0, 0, "minecraft:stone[lit=true]"]], "invalid_block"),
             ([[2, 1, 0, 0, 0, "minecraft:stone{a:1}"]], "invalid_block"),
             ([[99, 1, 0, 0, 0, "minecraft:stone"]], "invalid_actions"),
-            ([[2, 1, 0, 0, 0, "minecraft:stone"]] * 9, "invalid_actions"),
+            ([[2, 1, 0, 0, 0, "minecraft:stone"]] * (CLIP_MAX_ACTIONS + 1), "invalid_actions"),
+            ([[2, 1, CLIP_ACTION_RANGE + 1, 0, 0, "minecraft:stone"]], "invalid_actions"),
         ):
             self.r.clock.advance(2)
             status, body, _ = self.publish(a, clip(actions=actions))
@@ -257,7 +276,7 @@ class EchoApiTest(unittest.TestCase):
         a = self.session()
         big = clip()
         big["actions"] = []
-        raw = json.dumps(big).encode() + b" " * 16384
+        raw = json.dumps(big).encode() + b" " * make_config().echo_max_body_bytes
         status, body, _ = self.r.request("PUT", "/v1/echoes/clip", token=a, raw_body=raw,
                                          headers={"Content-Type": "application/json"})
         self.assertEqual(status, 413)
@@ -269,21 +288,26 @@ class EchoApiTest(unittest.TestCase):
 
     def test_maximal_clip_fits_body_limit(self):
         a = self.session(chat=True)
-        frames = [[2 * i, -1536 if i else 0, 0, 0, 255, -64, 255, 31] for i in range(60)]
-        frames[1:] = [[2 * i, -24 * i, -2 * i, -24 * i, 255, -64, 255, 31] for i in range(1, 60)]
-        actions = [[i * 4, 1, -1 - i // 4, -1, -2, "abcdefghijklmnopqrstuvwxyz012345:" + "p" * 64]
-                   for i in range(8)]
-        actions = [[t, k, round(frames[t // 2][1] / 32), 0, round(frames[t // 2][3] / 32), b]
-                   for t, k, _, _, _, b in actions]
-        body = clip(frames=frames, actions=actions, chat=[[2, "\U0001F600" * 64], [4, "ü" * 64]])
-        body.update(realm="abcdefghijklmnopqrstuvwxyz012345:" + "p" * 64, profile="p" * 64, instance="i" * 64,
-                    x=-29999999.123456789, y=-2047.123456789, z=-29999999.123456789)
+        body = maximal_clip()
         # Worst case even with every non-ASCII character escaped by the client.
         size = len(json.dumps(body, separators=(",", ":")).encode())
-        self.assertLess(size, 6144)
+        self.assertLess(size, make_config().echo_max_body_bytes // 2)
         status, resp, _ = self.publish(a, body)
         self.assertEqual(status, 200, resp)
 
+
+    def test_minute_of_play_every_tick(self):
+        """A full window sampled every tick, building and mining all the way, is accepted whole."""
+        a = self.session()
+        frames = [[t, 4 * t, 0, 0, t % 256, 0, t % 256, 1] for t in range(CLIP_MAX_FRAMES)]
+        actions = [[t, 1 + t % 2, round(4 * t / 32), -1, 1, "minecraft:stone"]
+                   for t in range(0, CLIP_MAX_TICKS + 1, 2)][:CLIP_MAX_ACTIONS]
+        self.assertEqual(len(actions), 601)
+        status, resp, _ = self.publish(a, clip(frames=frames, actions=actions))
+        self.assertEqual(status, 200, resp)
+        echo = self.fetch(self.r.create(capabilities=["echoes"]))[1]["echo"]
+        self.assertEqual(len(echo["frames"]), CLIP_MAX_FRAMES)
+        self.assertEqual(len(echo["actions"]), 601)
 
 class EchoStoreTest(unittest.TestCase):
     def test_per_cell_cap_and_bounded_lookup(self):
@@ -325,3 +349,23 @@ class EchoStoreTest(unittest.TestCase):
         self.assertEqual(s.db.execute("SELECT count(*) FROM delivered").fetchone()[0], 5)
         s.delete_session(tok)
         self.assertEqual(s.db.execute("SELECT count(*) FROM delivered").fetchone()[0], 0)
+
+
+class LiveBudgetTest(unittest.TestCase):
+    def test_live_bytes_are_counted_and_bounded(self):
+        now = [0.0]
+        s = Store(30, 10_000, clock=lambda: now[0], echo_live_bytes=1000)
+        a, b = (s.create_session(echoes=True)[1] for _ in range(2))
+        s.publish_clip(a, "r", "p", "ia", 1, 64, 1, "x" * 600, None, None)
+        self.assertEqual(s.clip_bytes(), 600)
+        with self.assertRaises(LiveFullError):
+            s.publish_clip(b, "r", "p", "ib", 1, 64, 1, "y" * 500, None, None)
+        self.assertEqual(s.clip_bytes(), 600)
+        # Replacing one's own clip only counts the difference.
+        s.publish_clip(a, "r", "p", "ia", 1, 64, 1, "x" * 900, "[]", None)
+        self.assertEqual(s.clip_bytes(), 902)
+        now[0] = 1000
+        s.purge()
+        self.assertEqual(s.clip_bytes(), 0)
+        s.publish_clip(b, "r", "p", "ib", 1, 64, 1, "y" * 500, None, None)
+        self.assertEqual(s.clip_bytes(), 500)

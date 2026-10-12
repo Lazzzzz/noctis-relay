@@ -101,7 +101,7 @@ class Client:
             try:
                 with self.opener.open(request, timeout=12) as response:
                     raw = response.read(16385)
-                    if response.status != expected or len(raw) > 16384:
+                    if response.status != expected or len(raw) > 1 << 20:
                         raise ValueError("unexpected or oversized relay response")
                     return json.loads(raw) if raw else None
             except urllib.error.HTTPError as error:

@@ -3,7 +3,7 @@
 All bodies are UTF-8 JSON objects with `Content-Type: application/json` and a
 `Content-Length` (no chunked encoding). Unknown fields, duplicate keys, `NaN`,
 `Infinity`, booleans where numbers are expected and bodies above
-`NOCTIS_MAX_BODY_BYTES` (1024 by default; `NOCTIS_ECHO_MAX_BODY_BYTES`, 16384
+`NOCTIS_MAX_BODY_BYTES` (1024 by default; `NOCTIS_ECHO_MAX_BODY_BYTES`, 524288
 by default, for `PUT /v1/echoes/clip`) are rejected. Errors are
 `{"error": "<code>"}`. Responses carry `Cache-Control: no-store` and no CORS
 headers: the API is meant for the game client, not for browsers.
@@ -37,7 +37,7 @@ they answer `404`.
   "heartbeatSeconds": 10,
   "operator": {"name": "Example relay", "contact": "relay-admin@example.org"},
   "capabilities": ["sessions"],
-  "server": {"name": "noctis-relay", "version": "0.5.0"}
+  "server": {"name": "noctis-relay", "version": "0.6.0"}
 }
 ```
 
@@ -247,15 +247,16 @@ session without `chat` gets the same error.
   settings (never the seed) and shares `instance` among all players of one
   server run, so they never see each other.
 - `account`: lowercase UUID of the Minecraft account. It is **not verified**.
-- `frames`: 2–60 arrays `[t, dx, dy, dz, yaw, pitch, head, flags]`; `t` in
-  ticks (0–120, strictly increasing, first frame `[0,0,0,0,…]`), offsets in
-  1/32 block (±1536), `yaw`/`head` 0–255, `pitch` −64…64, `flags` bits
+- `frames`: 2–1201 arrays `[t, dx, dy, dz, yaw, pitch, head, flags]`; `t` in
+  ticks (0–1200, strictly increasing, first frame `[0,0,0,0,…]`; the mod
+  samples every tick), offsets in 1/32 block (±131072, i.e. 4096 blocks),
+  `yaw`/`head` 0–255, `pitch` −64…64, `flags` bits
   1 ground, 2 crouch, 4 sprint, 8 swing, 16 swim. Steps faster than
-  `NOCTIS_ECHO_MAX_SPEED` (1.2) blocks/tick horizontally or
-  `NOCTIS_ECHO_MAX_VERTICAL_SPEED` (4.0) vertically get
-  `400 implausible_movement`.
-- `actions` (optional): ≤ 8 arrays `[t, kind, bx, by, bz, block]`, `kind`
-  1 break / 2 place, block offsets ±64, `block` a `namespace:path` id. Each
+  `NOCTIS_ECHO_MAX_SPEED` (10) blocks/tick horizontally or
+  `NOCTIS_ECHO_MAX_VERTICAL_SPEED` (10) vertically get
+  `400 implausible_movement`: elytra and jetpack flights pass, teleports do not.
+- `actions` (optional): ≤ 1024 arrays `[t, kind, bx, by, bz, block]`, `kind`
+  1 break / 2 place, block offsets ±4096, `block` a `namespace:path` id. Each
   offset is relative to the block containing the origin: the world position is
   `(floor(x)+bx, floor(y)+by, floor(z)+bz)`. The origin is transmitted without
   rounding, including at negative coordinates and block boundaries. An action
@@ -310,10 +311,10 @@ below; `NOCTIS_ECHO_GEAR=0` removes it and the key is then refused as
          "pose": [[4, 1, 60]]}
 ```
 
-- `items`: ≤ 12 distinct strings, each the padded standard base64 of one item
+- `items`: ≤ 64 distinct strings, each the padded standard base64 of one item
   stack in binary NBT as written by Minecraft (`NbtIo.write` of the item
   codec: a root compound with `id`, `count` 1–99 and optional `components`),
-  ≤ 2048 bytes each and 6144 in total, depth ≤ 12, ≤ 512 tags, lists ≤ 256,
+  ≤ 8192 bytes each and 98304 in total, depth ≤ 12, ≤ 512 tags, lists ≤ 256,
   strings ≤ 1024 bytes, no compression. Components holding stored contents,
   writings, places or captured entities and blocks are refused, set or
   removed: `minecraft:` `container`, `bundle_contents`,
@@ -322,17 +323,23 @@ below; `NOCTIS_ECHO_GEAR=0` removes it and the key is then refused as
   `block_entity_data`, `bees`, `container_loot`, `recipes`,
   `debug_stick_state`. Names, lore, custom data and modded components are kept,
   as models and resource packs select on them.
-- `slots`: ≤ 48 changes `[t, slot, item]`, `t` non-decreasing up to the tick of
+- `slots`: ≤ 1024 changes `[t, slot, item]`, `t` non-decreasing up to the tick of
   the last frame; every slot starts empty; `item` indexes `items` or is −1
   (empty), each change differs from the slot's current item, every item is
   used. `slot` is `head`, `chest`, `legs`, `feet`, `mainhand`, `offhand` or a
   `namespace:path` (≤ 16 distinct).
-- `pose`: ≤ 64 changes `[t, bits, power]` from the neutral `[0, 0]`, `t`
+- `pose`: ≤ 1201 changes `[t, bits, power]` from the neutral `[0, 0]`, `t`
   strictly increasing up to the last frame; `bits` 1 fall flying, 2 using an
   item, 4 using the off hand (with 2), 8 off-hand swing, 16 left-handed,
   32 spin attack; `power` 0–100 (jetpack thrust percent).
 - At least one of `slots` and `pose` is non-empty; the compact JSON of `gear`
-  is at most 10240 bytes, so the largest clip with gear stays below 16 KiB.
+  is at most 262144 bytes, so the largest clip with gear stays below 512 KiB.
+
+These bounds are safety caps far above play: a minute of a player sampled every
+tick, every swap and every block they touch, fits whole. The relay also keeps
+the live clips of all sessions under `NOCTIS_ECHO_LIVE_BYTES` (64 MiB by
+default); beyond it a new or larger clip gets `503 overloaded` with
+`Retry-After`, until clips expire.
 
 The relay checks this structure, stores the canonical form with the clip (same
 lifetime, archive and deletion) and never interprets the items. Receivers must

@@ -9,6 +9,7 @@ no chunked encoding, no redirects, no CORS and no access logs.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import hashlib
 import ipaddress
 import json
@@ -27,7 +28,7 @@ from .archive import QUOTA_REVISION, Archive, ArchiveError, owner_hash
 from .config import Config, ConfigError, load_config, load_deny_file
 from .profanity import Filter
 from .ratelimit import Bucket, Concurrency, Fingerprints, NetworkSet, TokenBuckets, client_key, prefix_key
-from .store import ARCHIVE_SEEN, AreaFullError, CapacityError, Echo, Session, Store
+from .store import ARCHIVE_SEEN, AreaFullError, CapacityError, Echo, LiveFullError, Session, Store
 
 log = logging.getLogger("noctis_relay")
 
@@ -46,11 +47,13 @@ MIN_Y, MAX_Y = -2048, 4096
 KNOWN_CAPABILITIES = ("presence", "echoes", "chat")
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 BLOCK_RE = re.compile(r"[a-z0-9_.-]{1,32}:[a-z0-9_./-]{1,64}")
-# Echo clip schema (see PROTOCOL.md). Offsets are in 1/32 block.
-CLIP_MAX_FRAMES = 60
-CLIP_MAX_TICKS = 120
-CLIP_MAX_OFFSET = 1536
-CLIP_MAX_ACTIONS = 8
+# Echo clip schema (see PROTOCOL.md). Offsets are in 1/32 block. A clip holds
+# up to a minute sampled every tick, so an echo replays real play, not a pose.
+CLIP_MAX_TICKS = 1200
+CLIP_MAX_FRAMES = CLIP_MAX_TICKS + 1
+CLIP_MAX_OFFSET = 4096 * 32
+CLIP_MAX_ACTIONS = 1024
+CLIP_ACTION_RANGE = 4096
 CLIP_ACTION_REACH = 6.5
 CLIP_MAX_CHAT = 2
 CHAT_MAX_CHARS = 64
@@ -233,6 +236,7 @@ class Relay:
             echo_radius=config.echo_radius,
             echo_vertical=config.echo_vertical,
             echo_max_per_cell=config.echo_max_per_cell,
+            echo_live_bytes=config.echo_live_bytes,
         )
         self.fingerprints = Fingerprints()
         size = config.rate_table_size
@@ -567,6 +571,8 @@ class Relay:
             self.store.publish_clip(session, realm, profile, instance, x, y, z, body, chat, chat_hash, req.client)
         except AreaFullError:
             raise HttpError(503, "area_full", {"Retry-After": str(self.config.echo_ttl)}) from None
+        except LiveFullError:
+            raise HttpError(503, "overloaded", {"Retry-After": str(self.config.echo_ttl)}) from None
         archived = self._archive(session, account, realm, profile, instance, x, y, z, frames, actions, body, chat)
         return Response(200, {
             "expiresInSeconds": self.config.echo_ttl,
@@ -721,22 +727,25 @@ def _actions(raw, frames: list, origin: tuple) -> list:
     # Integer offsets use the origin's containing block; frames use its exact
     # position. Convert the block centre to that same relative coordinate space.
     fx, fy, fz = (v - math.floor(v) for v in origin)
+    ticks = [f[0] for f in frames]
     out = []
     for item in raw:
         if not isinstance(item, list) or len(item) != 6:
             raise HttpError(400, "invalid_actions")
         t = _int_in(item[0], 0, end, "invalid_actions")
         kind = _int_in(item[1], 1, 2, "invalid_actions")
-        bx, by, bz = (_int_in(v, -64, 64, "invalid_actions") for v in item[2:5])
+        bx, by, bz = (_int_in(v, -CLIP_ACTION_RANGE, CLIP_ACTION_RANGE, "invalid_actions") for v in item[2:5])
         block = item[5]
         if not isinstance(block, str) or not BLOCK_RE.fullmatch(block):
             raise HttpError(400, "invalid_block")
-        # The block must be within reach of the replayed body near that tick.
+        # The block must be within reach of the replayed body near that tick;
+        # frames are ordered, so only the few within 10 ticks are examined.
         cx, cy, cz = bx + 0.5 - fx, by + 0.5 - fy, bz + 0.5 - fz
+        first = bisect.bisect_left(ticks, t - 10)
+        last = bisect.bisect_right(ticks, t + 10)
         if not any(
-            abs(f[0] - t) <= 10
-            and math.dist((f[1] / 32.0, f[2] / 32.0 + 1.5, f[3] / 32.0), (cx, cy, cz)) <= CLIP_ACTION_REACH
-            for f in frames
+            math.dist((f[1] / 32.0, f[2] / 32.0 + 1.5, f[3] / 32.0), (cx, cy, cz)) <= CLIP_ACTION_REACH
+            for f in frames[first:last]
         ):
             raise HttpError(400, "implausible_action")
         out.append([t, kind, bx, by, bz, block])

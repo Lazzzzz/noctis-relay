@@ -3,7 +3,7 @@
 # No `log` directive: Caddy writes no access log.
 {$NOCTIS_DOMAIN} {
 	request_body {
-		max_size 4KB
+		max_size 512KB
 	}
 	reverse_proxy relay:8787 {
 		# Replace any client-supplied value with the real peer address.

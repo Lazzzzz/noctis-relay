@@ -138,6 +138,15 @@ Les clips peuvent maintenant porter l'équipement visible (`gear`, désactivable
 par `NOCTIS_ECHO_GEAR=0`) ; le corps d'envoi passe à 16 Kio
 (`NOCTIS_ECHO_MAX_BODY_BYTES=16384`, maximum).
 
+**Mise à jour 0.5.0 → 0.6.0.** Les clips couvrent jusqu'à une minute
+échantillonnée à chaque tick, avec 1024 actions et un équipement plus riche.
+Porter `NOCTIS_ECHO_MAX_BODY_BYTES` à 524288 (maximum, valeur par défaut) et,
+s'ils sont fixés, `NOCTIS_ECHO_MAX_SPEED` et `NOCTIS_ECHO_MAX_VERTICAL_SPEED`
+à 10 ; relever la limite de corps d'un mandataire placé devant (le
+`Caddyfile` fourni accepte 512 Kio). `NOCTIS_ECHO_LIVE_BYTES` borne la mémoire
+des clips en direct (64 Mio). Les archives existantes restent lisibles, sans
+migration. Un relais 0.5.0 refuse les clips longs des nouveaux clients.
+
 ### Exploitation
 
 - Mise à jour : `git pull && docker compose --profile https up -d --build`.
@@ -281,6 +290,14 @@ after startup with `tools/seed_previews.py --renew` (see
 [tools/README.md](tools/README.md)). Clips may now carry visible equipment
 (`gear`, turned off by `NOCTIS_ECHO_GEAR=0`); the upload body grows to 16 KiB
 (`NOCTIS_ECHO_MAX_BODY_BYTES=16384`, the maximum).
+
+**Upgrading 0.5.0 → 0.6.0.** Clips span up to one minute sampled every tick,
+with 1024 actions and richer equipment. Raise `NOCTIS_ECHO_MAX_BODY_BYTES` to
+524288 (the maximum and default) and, if set, `NOCTIS_ECHO_MAX_SPEED` and
+`NOCTIS_ECHO_MAX_VERTICAL_SPEED` to 10; raise the body limit of any proxy in
+front (the bundled `Caddyfile` accepts 512 KiB). `NOCTIS_ECHO_LIVE_BYTES`
+bounds the memory of live clips (64 MiB). Existing archives stay readable, no
+migration. A 0.5.0 relay refuses the long clips of new clients.
 
 ### Operations
 

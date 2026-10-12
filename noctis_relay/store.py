@@ -95,6 +95,24 @@ CREATE UNIQUE INDEX clip_sid ON clip(sid);
 CREATE UNIQUE INDEX clip_id ON clip(clip_id);
 CREATE INDEX clip_expires ON clip(expires);
 
+-- Bytes of every live clip, kept by triggers on every insert, update and
+-- delete path, so the memory budget is checked without scanning clips.
+CREATE TABLE clip_bytes (total INTEGER NOT NULL);
+INSERT INTO clip_bytes VALUES (0);
+CREATE TRIGGER clip_bytes_insert AFTER INSERT ON clip BEGIN
+    UPDATE clip_bytes SET total = total + length(CAST(NEW.body AS BLOB))
+        + coalesce(length(CAST(NEW.chat AS BLOB)), 0);
+END;
+CREATE TRIGGER clip_bytes_delete AFTER DELETE ON clip BEGIN
+    UPDATE clip_bytes SET total = total - length(CAST(OLD.body AS BLOB))
+        - coalesce(length(CAST(OLD.chat AS BLOB)), 0);
+END;
+CREATE TRIGGER clip_bytes_update AFTER UPDATE OF body, chat ON clip BEGIN
+    UPDATE clip_bytes SET total = total
+        + length(CAST(NEW.body AS BLOB)) + coalesce(length(CAST(NEW.chat AS BLOB)), 0)
+        - length(CAST(OLD.body AS BLOB)) - coalesce(length(CAST(OLD.chat AS BLOB)), 0);
+END;
+
 -- Clips already handed to an observer, so each is replayed at most once
 -- (archived clips are recorded under their negated archive id).
 CREATE TABLE delivered (
@@ -163,6 +181,10 @@ class AreaFullError(Exception):
     """The target presence cell already holds its maximum of live positions."""
 
 
+class LiveFullError(Exception):
+    """Live clips already use the relay's whole memory budget."""
+
+
 class Store:
     def __init__(
         self,
@@ -179,6 +201,7 @@ class Store:
         echo_radius: int = 48,
         echo_vertical: int = 16,
         echo_max_per_cell: int = 0,
+        echo_live_bytes: int = 0,
     ) -> None:
         self.retention = float(retention_seconds)
         self.max_sessions = max_sessions
@@ -201,6 +224,7 @@ class Store:
         self.echo_radius = echo_radius
         self.echo_vertical = echo_vertical
         self.echo_max_per_cell = echo_max_per_cell
+        self.echo_live_bytes = echo_live_bytes
         self._echo_span = math.ceil(echo_radius / cell_size)
         self._echo_sql = self._build_echo_sql()
         self._clip_ids = 0
@@ -494,7 +518,7 @@ class Store:
         x: float, y: float, z: float, body: str, chat: str | None, chat_hash: bytes | None,
         net: bytes | None = None,
     ) -> float:
-        """Replace the caller's clip. Raises AreaFullError without any change."""
+        """Replace the caller's clip. Raises AreaFullError or LiveFullError without any change."""
         now = self.clock()
         net = session.net if net is None else net
         cx, cz, cy = self.cell_of(x, y, z)
@@ -507,6 +531,15 @@ class Store:
                 (realm, profile, cx, cz, cy, now, session.sid, self.echo_max_per_cell),
             ).fetchone()[0] >= self.echo_max_per_cell:
                 raise AreaFullError()
+            if self.echo_live_bytes:
+                size = len(body.encode("utf-8")) + (len(chat.encode("utf-8")) if chat else 0)
+                held = db.execute("SELECT total FROM clip_bytes").fetchone()[0]
+                own = db.execute(
+                    "SELECT length(CAST(body AS BLOB)) + coalesce(length(CAST(chat AS BLOB)), 0) "
+                    "FROM clip WHERE sid = ?", (session.sid,),
+                ).fetchone()
+                if held - (own[0] if own else 0) + size > self.echo_live_bytes:
+                    raise LiveFullError()
             db.execute(
                 "UPDATE session SET expires = ?, last_publish = ?, net = ?, last_chat = ? WHERE sid = ?",
                 (now + self.retention, now, net,
@@ -567,6 +600,9 @@ class Store:
     def explain_echo(self) -> list[str]:
         params = self._echo_params("r", "p", 0.0, 64.0, 0.0, 0.0, 0, b"")
         return [row[3] for row in self.db.execute("EXPLAIN QUERY PLAN " + self._echo_sql, params)]
+
+    def clip_bytes(self) -> int:
+        return self.db.execute("SELECT total FROM clip_bytes").fetchone()[0]
 
     def clip_count(self) -> int:
         return self.db.execute("SELECT count(*) FROM clip").fetchone()[0]

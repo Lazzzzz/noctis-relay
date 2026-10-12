@@ -78,8 +78,8 @@ un client modifié peut en inventer.
 compte Minecraft** (sans pseudo, skin ni jeton de connexion), la dimension, un
 profil de terrain opaque (jamais la graine), l'identifiant aléatoire de la
 partie en cours (le relais n'en garde qu'une empreinte SHA-256 tronquée), une
-position d'origine, au plus 6 secondes de mouvements (positions relatives,
-orientation, accroupi/sprint/nage/geste), au plus 8 poses ou casses de blocs
+position d'origine, au plus 60 secondes de mouvements (positions relatives,
+orientation, accroupi/sprint/nage/geste), au plus 1024 poses ou casses de blocs
 (position relative, identifiant de bloc) et, si le relais l'annonce, votre
 **équipement visible** : objets portés ou tenus (armure, mains, réacteur dorsal,
 emplacements de mods) avec leurs données d'apparence (nom, description,
@@ -211,9 +211,9 @@ modified client can invent them.
 per session, replaced by the next one. It holds your **Minecraft account
 UUID** (no name, skin or login token), the dimension, an opaque terrain profile
 (never the seed), the random id of the running game (the relay keeps only a
-truncated SHA-256 of it), an origin position, at most 6 seconds of movement
+truncated SHA-256 of it), an origin position, at most 60 seconds of movement
 (relative positions, orientation, crouch/sprint/swim/swing flags), at most
-8 block placements or breaks (relative position, block id) and, if the relay
+1024 block placements or breaks (relative position, block id) and, if the relay
 announces it, your **visible equipment**: worn or held items (armour, hands,
 back jetpack, mod slots) with their appearance data (name, lore, mod
 components), their changes and a few poses (gliding, using an item, jetpack
