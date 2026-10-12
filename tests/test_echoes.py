@@ -276,10 +276,14 @@ class EchoApiTest(unittest.TestCase):
         a = self.session()
         big = clip()
         big["actions"] = []
-        raw = json.dumps(big).encode() + b" " * make_config().echo_max_body_bytes
-        status, body, _ = self.r.request("PUT", "/v1/echoes/clip", token=a, raw_body=raw,
-                                         headers={"Content-Type": "application/json"})
-        self.assertEqual(status, 413)
+        # Refused on its announced length, before the body is read: only its start is sent,
+        # as the server closes at once (a full upload would meet a reset on Linux).
+        limit = make_config().echo_max_body_bytes
+        reply = self.r.raw(
+            b"PUT /v1/echoes/clip HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+            + f"Authorization: Bearer {a}\r\nContent-Length: {limit + 1}\r\n\r\n".encode()
+            + json.dumps(big).encode())
+        self.assertEqual(int(reply.split(b" ", 2)[1]), 413, reply[:80])
         # The larger limit applies to clip uploads only.
         raw = json.dumps(place()).encode() + b" " * 2000
         status, _, _ = self.r.request("POST", "/v1/echoes/next", token=a, raw_body=raw,
